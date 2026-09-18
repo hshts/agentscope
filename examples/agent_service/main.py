@@ -16,6 +16,7 @@ from agentscope.app.channel import (
 from agentscope.app.hub import ClawSkillHub, GitHubMCPHub
 from agentscope.app.message_bus import InMemoryMessageBus
 from agentscope.app.rag.knowledge_base_manager import CollectionPerKbManager
+from agentscope.app.middleware import AGUIProtocolMiddleware
 from agentscope.app.storage import RedisStorage
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.mcp import MCPClient, StdioMCPConfig, HttpMCPConfig
@@ -50,6 +51,7 @@ if os.getenv("AMAP_API_KEY"):
 storage = RedisStorage(
     host="localhost",
     port=6379,
+    password="goatai123456"
 )
 
 vector_store = QdrantStore(location=":memory:")
@@ -86,7 +88,7 @@ app = create_app(
     # ),
     workspace_manager=LocalWorkspaceManager(
         basedir=os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
+            "/tmp",
             "workspaces",
         ),
         # The default MCP servers that will be added into the workspace
@@ -156,6 +158,10 @@ so anything you want them to see MUST be sent through `TeamSay`.""",
             allow_methods=["*"],
             allow_headers=["*"],
         ),
+        Middleware(
+            AGUIProtocolMiddleware
+        )
+
     ],
     channels=[
         DingTalkChannel,

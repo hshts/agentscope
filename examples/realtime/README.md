@@ -72,9 +72,8 @@ an unanswered one after five minutes.
   the built-in speakers:
 
   ```bash
-  REALTIME_INPUT_DEVICE=3 REALTIME_OUTPUT_DEVICE=2 python examples/realtime/local_mic.py
+  REALTIME_INPUT_DEVICE=3 REALTIME_OUTPUT_DEVICE=2 python agentscope/examples/realtime/local_mic.py
   ```
-
 - **Silence is fine.** DashScope closes a session after about three minutes
   without a response. The example logs that it happened and keeps the
   microphone open; the next thing you say reconnects the model, with the

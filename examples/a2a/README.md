@@ -25,7 +25,6 @@ conversation (`context_id`) and the Task the next message continues
   ```
 
   From an AgentScope source checkout, use `uv sync --extra a2a` instead.
-
 - A DashScope API key for the server's model.
 
 ## Run it
