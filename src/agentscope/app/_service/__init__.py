@@ -7,6 +7,7 @@ from ._access import (
     KnowledgeBaseView,
     ResourceAccessService,
 )
+from ._artifacts import ArtifactBlobService
 from ._channel import ChannelService
 from ._credential_binding import (
     CredentialBindingError,
@@ -32,6 +33,7 @@ from ._workspace import GitStatus, WorkspaceService, WorkspaceStatus
 
 __all__ = [
     "AgentView",
+    "ArtifactBlobService",
     "ChannelService",
     "CredentialBindingService",
     "CredentialBindingError",

@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """The agent state class."""
-from typing import Any, Type
+import os
+from collections.abc import Sequence
+from typing import Any, Literal, Type
 
 from pydantic import BaseModel, Field, field_serializer, model_validator
 
@@ -206,6 +208,129 @@ class ReplyContext(BaseModel):
     """The structured output generated within this reply."""
 
 
+class SessionArtifact(BaseModel):
+    """A workspace file produced during a session.
+
+    ``storage`` tells a consumer where the path is meaningful:
+
+    - ``"local"``: the agent ran on the host, so the path is a real
+      host path (open it directly, or serve it in place).
+    - ``"sandbox"``: the agent ran in a container/remote sandbox, so the
+      path only resolves through the session's workspace API
+      (``GET /workspace/files``), which streams it from the backend.
+
+    ``blob_uri`` is set when an uploaded copy exists, so the file stays
+    downloadable after the sandbox is gone. The middleware never copies
+    bytes for ``local`` runs.
+    """
+
+    path: str
+    """The normalized path of the file."""
+
+    agent_id: str = ""
+    """The agent that produced it, when known."""
+
+    storage: Literal["local", "sandbox"] = "local"
+    """Whether the path is host-visible or sandbox-internal."""
+
+    blob_uri: str = ""
+    """Blob-store URI of an uploaded copy, when one exists."""
+
+    def dedupe_key(self) -> str:
+        """The key used to dedupe entries within one session."""
+        path = self.path.strip()
+        return path.casefold() if os.name == "nt" else path
+
+
+class ArtifactContext(BaseModel):
+    """Artifacts recorded for the session that owns this agent state."""
+
+    entries: list[SessionArtifact] = Field(default_factory=list)
+    """Files produced by successful tool calls, oldest first."""
+
+    @property
+    def paths(self) -> list[str]:
+        """The recorded paths, in insertion order."""
+        return [entry.path for entry in self.entries]
+
+    def add_entries(
+        self,
+        entries: Sequence[SessionArtifact],
+        *,
+        max_entries: int = 200,
+    ) -> list[SessionArtifact]:
+        """Append *entries*, dropping duplicates and the oldest overflow.
+
+        Args:
+            entries (`Sequence[SessionArtifact]`):
+                Artifact entries to record.
+            max_entries (`int`, optional):
+                The maximum number of entries to retain.
+
+        Returns:
+            `list[SessionArtifact]`:
+                The entries actually added, in append order.
+        """
+        limit = max(1, int(max_entries))
+        seen = {entry.dedupe_key() for entry in self.entries}
+        added: list[SessionArtifact] = []
+        for entry in entries:
+            value = (entry.path or "").strip()
+            if not value:
+                continue
+            candidate = SessionArtifact(
+                path=value,
+                agent_id=entry.agent_id,
+                storage=entry.storage,
+                blob_uri=entry.blob_uri,
+            )
+            key = candidate.dedupe_key()
+            if key in seen:
+                continue
+            self.entries.append(candidate)
+            seen.add(key)
+            added.append(candidate)
+        if len(self.entries) > limit:
+            del self.entries[: len(self.entries) - limit]
+        return added
+
+    def add_paths(
+        self,
+        paths: Sequence[str],
+        *,
+        agent_id: str = "",
+        storage: Literal["local", "sandbox"] = "local",
+        max_entries: int = 200,
+    ) -> list[SessionArtifact]:
+        """Append *paths*, dropping duplicates and the oldest overflow.
+
+        Args:
+            paths (`Sequence[str]`):
+                Normalized file paths to record.
+            agent_id (`str`, optional):
+                The producer stamped on new entries.
+            storage (`Literal["local", "sandbox"]`, optional):
+                Whether the paths are host-visible or sandbox-internal.
+            max_entries (`int`, optional):
+                The maximum number of entries to retain.
+
+        Returns:
+            `list[SessionArtifact]`:
+                The entries actually added, in append order.
+        """
+        return self.add_entries(
+            [
+                SessionArtifact(
+                    path=path,
+                    agent_id=agent_id,
+                    storage=storage,
+                )
+                for path in paths
+            ],
+            max_entries=max_entries,
+        )
+
+
 class AgentState(BaseModel):
     """The agent state that should be saved and loaded from storage."""
 
@@ -281,6 +406,14 @@ class AgentState(BaseModel):
     # The tool context
     # =================================================================
     tool_context: ToolContext = Field(default_factory=ToolContext)
+
+    # =================================================================
+    # The artifact context
+    # =================================================================
+    artifact_context: ArtifactContext = Field(
+        default_factory=ArtifactContext,
+    )
+    """Workspace files produced by successful tool calls in this session."""
 
     # =================================================================
     # The tasks context

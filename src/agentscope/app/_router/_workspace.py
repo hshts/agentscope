@@ -18,13 +18,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from ..deps import (
+    get_artifact_blob_service,
     get_current_user_id,
     get_skill_hubs,
     get_storage,
     get_workspace_service,
 )
 from ..hub import SkillHubBase
-from .._service import WorkspaceService, WorkspaceStatus
+from .._service import ArtifactBlobService, WorkspaceService, WorkspaceStatus
 from .._service._workspace import SkillUploadError, UploadManifest
 from ..storage import MCPRecord, StorageBase
 from ...mcp import MCPClient
@@ -530,6 +531,49 @@ async def create_download_token(
     return DownloadTokenResponse(token=token, expires_at=expires_at)
 
 
+async def _blob_response(
+    artifact_blobs: ArtifactBlobService,
+    uri: str,
+    path: str,
+    download: bool,
+) -> StreamingResponse:
+    """Build a streaming response for an uploaded artifact.
+
+    The filename is taken from *path* rather than the workspace, since
+    this response must work after the workspace is gone.
+
+    Args:
+        artifact_blobs (`ArtifactBlobService`):
+            Service wrapping the blob store.
+        uri (`str`):
+            The blob URI to stream.
+        path (`str`):
+            The artifact path, used for the filename and media type.
+        download (`bool`):
+            Force a ``Content-Disposition: attachment`` header.
+
+    Returns:
+        `StreamingResponse`: The file body.
+    """
+    basename = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    basename = basename or "download"
+    headers: dict[str, str] = {}
+    size = await artifact_blobs.size(uri)
+    if size is not None:
+        headers["Content-Length"] = str(size)
+    if download:
+        headers[
+            "Content-Disposition"
+        ] = f"attachment; filename*=UTF-8''{quote(basename)}"
+    return StreamingResponse(
+        artifact_blobs.stream(uri),
+        media_type=(
+            mimetypes.guess_type(basename)[0] or "application/octet-stream"
+        ),
+        headers=headers,
+    )
+
+
 @workspace_router.get("/files")
 async def read_workspace_file(
     agent_id: str = Query(...),
@@ -553,12 +597,20 @@ async def read_workspace_file(
     ),
     x_user_id: str | None = Header(default=None),
     workspace_service: WorkspaceService = Depends(get_workspace_service),
+    artifact_blobs: ArtifactBlobService = Depends(
+        get_artifact_blob_service,
+    ),
 ) -> StreamingResponse:
     """Stream one file out of a session's workspace.
 
     The body is piped chunk by chunk rather than read whole: the API
     process is shared, so one large download must not be able to
     exhaust it for everyone else.
+
+    A sandbox artifact uploaded to the blob store is served from there
+    first. That lookup happens *before* the workspace is resolved, so
+    the file stays downloadable after the sandbox (or the workspace
+    record) is gone; only a cache miss falls back to the backend.
     """
     if token is not None:
         try:
@@ -576,6 +628,22 @@ async def read_workspace_file(
             detail="X-User-ID header or download token is required.",
         )
 
+    # Blob copies are self-contained: resolve them before touching the
+    # workspace, which may already have been torn down.
+    blob_uri = await artifact_blobs.blob_uri(
+        user_id,
+        agent_id,
+        session_id,
+        raw_path=path,
+    )
+    if blob_uri and await artifact_blobs.exists(blob_uri):
+        return await _blob_response(
+            artifact_blobs,
+            blob_uri,
+            path,
+            download,
+        )
+
     workspace = await workspace_service.resolve(
         user_id,
         agent_id,
@@ -584,6 +652,24 @@ async def read_workspace_file(
     backend = workspace.get_backend()
     target = backend.abspath(path, cwd=workspace.workdir)
     basename = backend.basename(target) or "download"
+
+    # Second lookup: a relative query only lines up with the recorded
+    # absolute path once the workspace root is known.
+    if not blob_uri:
+        blob_uri = await artifact_blobs.blob_uri(
+            user_id,
+            agent_id,
+            session_id,
+            target,
+            path,
+        )
+        if blob_uri and await artifact_blobs.exists(blob_uri):
+            return await _blob_response(
+                artifact_blobs,
+                blob_uri,
+                target,
+                download,
+            )
 
     entry = await backend.stat(target)
     if entry is None:

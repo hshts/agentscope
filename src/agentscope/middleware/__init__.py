@@ -4,6 +4,11 @@
 from ._base import MiddlewareBase
 from ._rag import RAGMiddleware
 from ._budget import ReplyBudgetControlMiddleware
+from ._session_artifacts import (
+    SessionArtifactStore,
+    SessionArtifactsMiddleware,
+    storage_mode_for,
+)
 from ._longterm_memory import (
     AgenticMemoryMiddleware,
     Mem0Middleware,
@@ -19,6 +24,9 @@ __all__ = [
     "Mem0Middleware",
     "ReMeMiddleware",
     "RAGMiddleware",
+    "SessionArtifactStore",
+    "SessionArtifactsMiddleware",
+    "storage_mode_for",
     "TracingMiddleware",
     "ReplyBudgetControlMiddleware",
     "TTSMiddleware",

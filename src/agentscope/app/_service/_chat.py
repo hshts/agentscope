@@ -30,6 +30,7 @@ from .._bus_ops import (
 )
 from ..message_bus import MessageBus, MessageBusKeys
 from ..rag.knowledge_base_manager import KnowledgeBaseManagerBase
+from ..rag.blob_store import BlobStoreBase
 from ..channel import ChatKind
 from ..storage import (
     StorageBase,
@@ -49,7 +50,11 @@ from ..middleware import (
     ToolOffloadMiddleware,
     TeamMemberLoopMiddleware,
 )
-from ...middleware import TTSMiddleware, RAGMiddleware
+from ...middleware import (
+    RAGMiddleware,
+    SessionArtifactsMiddleware,
+    TTSMiddleware,
+)
 from ...rag import KnowledgeBase
 from ...sop import SOPPhase
 from .._types import (
@@ -161,6 +166,7 @@ class ChatService:
         message_bus: MessageBus,
         resource_access_service: ResourceAccessService,
         knowledge_base_manager: KnowledgeBaseManagerBase | None = None,
+        blob_store: BlobStoreBase | None = None,
         extra_agent_middlewares: AgentMiddlewareFactory | None = None,
         extra_agent_tools: AgentToolFactory | None = None,
         custom_subagent_templates: dict[str, SubAgentTemplate] | None = None,
@@ -203,6 +209,12 @@ class ChatService:
                 is attached to the agent at run time.  ``None``
                 disables knowledge-base wiring even for sessions that
                 have one configured.
+            blob_store (`BlobStoreBase | None`, optional):
+                Application blob store. When provided, artifacts
+                produced inside a sandboxed workspace are uploaded here
+                as they are recorded, so they remain downloadable after
+                the sandbox is torn down. ``None`` leaves them in the
+                sandbox only.
             extra_agent_middlewares (`AgentMiddlewareFactory | None`, \
              optional):
                 Async factory invoked at every chat turn to produce
@@ -241,6 +253,7 @@ class ChatService:
         self._message_bus = message_bus
         self._access = resource_access_service
         self._knowledge_base_manager = knowledge_base_manager
+        self._blob_store = blob_store
         self._extra_agent_middlewares = extra_agent_middlewares
         # Probed once (the service is built once per lifespan) so legacy
         # three-argument factories keep working without the per-turn cost.
@@ -986,6 +999,23 @@ class ChatService:
                     StateChangeMiddleware(
                         message_bus=self._message_bus,
                         session_id=session_id,
+                    ),
+                    # Outer to ToolOffload: a timed-out tool call records
+                    # its paths from the call arguments before the turn's
+                    # state is persisted.
+                    SessionArtifactsMiddleware(
+                        workspace_dir=workspace.workdir,
+                        agent_id=agent_id,
+                        user_id=user_id,
+                        store=self._storage,
+                        # Only used to stamp ``storage`` on artifacts;
+                        # duck-typed workspaces in tests may not expose it.
+                        backend=(
+                            workspace.get_backend()
+                            if hasattr(workspace, "get_backend")
+                            else None
+                        ),
+                        blob_store=self._blob_store,
                     ),
                     ToolOffloadMiddleware(
                         bg_manager=self._background_task_manager,

@@ -184,10 +184,14 @@ class SessionView(BaseModel):
             "``tool_context`` is reset. Those hold the conversation the "
             "model sees and the contents of every file it has read, so "
             "listing twenty sessions would otherwise ship twenty "
-            "transcripts to render a sidebar. ``permission_context`` "
-            "and ``tasks_context`` survive — they are small, and the UI "
-            "seeds its panels from them. Read a session's messages via "
-            "``GET /sessions/{id}/messages``."
+            "transcripts to render a sidebar. ``permission_context``, "
+            "``tasks_context`` and ``artifact_context`` survive — they "
+            "are small, and the UI seeds its panels from them. Each "
+            "``artifact_context`` entry carries ``storage``: ``local`` "
+            "means the path is host-visible, ``sandbox`` means it must "
+            "be fetched through ``GET /workspace/files`` (which serves "
+            "the blob-store copy first when ``blob_uri`` is set). Read a "
+            "session's messages via ``GET /sessions/{id}/messages``."
         ),
     )
     is_running: bool = Field(

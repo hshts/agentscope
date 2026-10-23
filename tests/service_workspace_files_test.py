@@ -20,7 +20,7 @@ from agentscope.app._router._workspace import (
     list_workspace_directory,
     read_workspace_file,
 )
-from agentscope.app._service import WorkspaceService
+from agentscope.app._service import ArtifactBlobService, WorkspaceService
 from agentscope.app.storage import (
     AgentData,
     AgentRecord,
@@ -312,6 +312,7 @@ class WorkspaceFileEndpointTests(IsolatedAsyncioTestCase):
         self._wm = _FakeWorkspaceManager(self._workspace)
         self._storage = _FakeStorage([_make_session()])
         self._service = WorkspaceService(self._storage, self._wm, SECRET)
+        self._artifact_blobs = ArtifactBlobService(self._storage, None)
 
     # ------------------------------------------------------------------
     # directories
@@ -416,11 +417,66 @@ class WorkspaceFileEndpointTests(IsolatedAsyncioTestCase):
 
     async def _read(self, **kwargs: object) -> object:
         """Call the file endpoint with the shared fixtures filled in."""
-        return await read_workspace_file(
-            agent_id="a",
-            session_id="s",
-            workspace_service=self._service,
-            **kwargs,
+        params: dict[str, object] = {
+            "agent_id": "a",
+            "session_id": "s",
+            "workspace_service": self._service,
+            "artifact_blobs": self._artifact_blobs,
+        }
+        params.update(kwargs)
+        return await read_workspace_file(**params)
+
+    async def test_blob_artifact_download_does_not_need_workspace(
+        self,
+    ) -> None:
+        """An uploaded sandbox artifact outlives a destroyed workspace."""
+        import io
+        import tempfile
+
+        from agentscope.app.rag.blob_store import LocalBlobStore
+        from agentscope.state import SessionArtifact
+
+        class _BrokenManager:
+            async def get_workspace(self, *args: object, **kwargs: object):
+                raise RuntimeError("workspace destroyed")
+
+        with tempfile.TemporaryDirectory() as root:
+            store = LocalBlobStore(root)
+            async with store:
+                uri = await store.write_stream(
+                    "artifacts/s/workspace/a.md",
+                    io.BytesIO(b"archived"),
+                )
+                record = _make_session()
+                record.state.artifact_context.add_entries([
+                    SessionArtifact(
+                        path="/workspace/a.md",
+                        storage="sandbox",
+                        blob_uri=uri,
+                    ),
+                ])
+                storage = _FakeStorage([record])
+                service = WorkspaceService(storage, _BrokenManager(), SECRET)
+                blobs = ArtifactBlobService(storage, store)
+
+                response = await read_workspace_file(
+                    agent_id="a",
+                    session_id="s",
+                    path="/workspace/a.md",
+                    download=True,
+                    token=None,
+                    x_user_id="u",
+                    workspace_service=service,
+                    artifact_blobs=blobs,
+                )
+                body = b"".join(
+                    [chunk async for chunk in response.body_iterator],
+                )
+
+        self.assertEqual(body, b"archived")
+        self.assertIn(
+            "attachment",
+            response.headers["content-disposition"],
         )
 
     async def test_read_streams_content_with_inferred_type(self) -> None:

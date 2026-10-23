@@ -2,6 +2,7 @@
 # pylint: disable=too-many-public-methods
 """The storage base class."""
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any, Self
 
@@ -26,7 +27,7 @@ from ._model import (
 from ...credential import CredentialBase
 from ...message import Msg
 from ...sop import SOPPhase, SOPRunState
-from ...state import AgentState
+from ...state import AgentState, SessionArtifact
 
 
 class StorageBase(ABC):
@@ -450,6 +451,63 @@ class StorageBase(ABC):
             session_id (`str`): The session id.
             state (`AgentState`): The new agent state to persist.
         """
+
+    async def append_session_artifacts(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        artifacts: Sequence[SessionArtifact],
+        *,
+        max_entries: int = 200,
+    ) -> list[SessionArtifact]:
+        """Append artifacts to an existing session's state.
+
+        Concrete default implementation: reads the session, merges the
+        entries into ``state.artifact_context``, and writes the state
+        back through :meth:`update_session_state`. The read-modify-write
+        makes this a whole-record update on every backend — callers are
+        expected to hold the per-session run lock (as the chat service
+        does) so two writers cannot drop each other's entries.
+
+        Backends that keep artifacts in a dedicated column/table can
+        override this to append without rewriting the conversation
+        context.
+
+        Args:
+            user_id (`str`):
+                The owner user id.
+            agent_id (`str`):
+                The agent id.
+            session_id (`str`):
+                The session whose artifacts should grow.
+            artifacts (`Sequence[SessionArtifact]`):
+                Entries to append. Duplicates are ignored.
+            max_entries (`int`, optional):
+                Maximum number of entries retained in the session state.
+
+        Returns:
+            `list[SessionArtifact]`:
+                The entries actually added, in append order.
+        """
+        if not artifacts:
+            return []
+        record = await self.get_session(user_id, agent_id, session_id)
+        if record is None:
+            return []
+        added = record.state.artifact_context.add_entries(
+            artifacts,
+            max_entries=max_entries,
+        )
+        if not added:
+            return []
+        await self.update_session_state(
+            user_id,
+            agent_id,
+            session_id,
+            record.state,
+        )
+        return added
 
     @abstractmethod
     async def list_sessions(

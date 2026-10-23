@@ -14,6 +14,7 @@ from ._manager import (
     WakeupDispatcher,
 )
 from ._service import (
+    ArtifactBlobService,
     ChannelService,
     CredentialBindingService,
     ChatService,
@@ -172,6 +173,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             message_bus=message_bus,
             resource_access_service=resource_access_service,
             knowledge_base_manager=knowledge_base_manager,
+            blob_store=blob_store,
             extra_agent_middlewares=app.state.extra_agent_middlewares,
             extra_agent_tools=app.state.extra_agent_tools,
             custom_subagent_templates=app.state.custom_subagent_templates,
@@ -216,6 +218,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             storage=storage,
             workspace_manager=workspace_manager,
             download_secret=app.state.download_secret,
+        )
+        # Artifact addressing is deliberately separate from the workspace
+        # service: an uploaded copy must outlive the workspace itself.
+        app.state.artifact_blob_service = ArtifactBlobService(
+            storage=storage,
+            blob_store=blob_store,
         )
 
         # ---------------- Knowledge-base wiring ----------------

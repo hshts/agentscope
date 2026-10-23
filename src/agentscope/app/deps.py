@@ -13,6 +13,7 @@ from ._manager import (
     SchedulerManager,
 )
 from ._service import (
+    ArtifactBlobService,
     ChannelService,
     CredentialBindingService,
     ChatService,
@@ -138,6 +139,20 @@ async def get_workspace_service(request: Request) -> WorkspaceService:
         `WorkspaceService`: The instance stored in ``app.state``.
     """
     return request.app.state.workspace_service
+
+
+async def get_artifact_blob_service(
+    request: Request,
+) -> ArtifactBlobService:
+    """Return the artifact blob service.
+
+    Args:
+        request (`Request`): The incoming FastAPI request.
+
+    Returns:
+        `ArtifactBlobService`: The instance stored in ``app.state``.
+    """
+    return request.app.state.artifact_blob_service
 
 
 async def get_chat_run_registry(request: Request) -> ChatRunRegistry:
