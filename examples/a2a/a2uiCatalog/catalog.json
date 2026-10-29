@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://flutter.dev/catalogs/agent/v1/catalog.json",
+  "protocolVersion": "1.0",
+  "title": "A2UI Agent Interaction Catalog",
+  "description": "Catalog of components that surface what an agent is doing and ask the user to confirm an action: ThinkingBar, ToolCall and HumanConfirm.",
+  "catalogId": "https://flutter.dev/catalogs/agent/v1/catalog.json",
+  "instructions": "This catalog shows agent activity and asks the user to confirm an action. Use it in surfaces that mirror the agent's own progress, not for presenting domain content, which the basic catalog's components are better at.\n\n## Components\n\n- `ThinkingBar`: A compact status strip. Use it while the agent is preparing a reply, with `status` `thinking`, and set `details` when the reasoning or progress is worth expanding. Switch `text` to the current step, and `status` to `done` or `error` when the work finishes. Keep `text` to one short sentence, such as `Thinking…` or `Searching the knowledge base…`.\n- `ToolCall`: One tool invocation, identified by `name`, with `status` `pending`, `running`, `success` or `error`. Put the request payload in `arguments` and the response in `result`, as strings (JSON encoded when structured). Both are collapsed by default and shown when the user expands the row, so they can be long.\n- `HumanConfirm`: A card that asks the user to approve or reject an action. `title` is a short question, `message` explains the consequences, and `severity` (`info`, `warning`, `danger`) sets the tone. `confirmAction` and `cancelAction` are standard A2UI actions: dispatch an `event` whose `name` tells you which way the user decided.\n\n## Rules\n\n1. These three components are leaves. They take no children; compose them with `Column`, `Row` or `Card` from the basic catalog.\n2. Mixing catalogs in one surface requires an explicit `catalogId`. When the surface's default `catalogId` is this catalog, every component taken from the basic catalog must name it, and the reverse is also true. If a surface only shows these components, keep this catalog as its default and give the agent one component per row.\n3. Bindings use the v1.0 markers: `{\"@path\": \"/progress/step\"}` reads the data model and `{\"@call\": \"formatString\", \"args\": {...}}` computes a value. Use literal strings for anything the agent already knows.\n4. Set `status` yourself as work advances; it is a literal, not a binding, unless the data model holds the state.\n5. `HumanConfirm` needs a decision event. Do not render it with only a confirm action plus an implicit cancellation, and do not leave `confirmAction` out.\n\n## Example: progress\n\n```json\n[\n  {\n    \"version\": \"v1.0\",\n    \"createSurface\": {\n      \"surfaceId\": \"research\",\n      \"catalogId\": \"https://flutter.dev/catalogs/agent/v1/catalog.json\",\n      \"components\": [\n        {\n          \"id\": \"root\",\n          \"component\": \"Column\",\n          \"children\": [\"thinking\", \"search\"],\n          \"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"\n        },\n        {\n          \"id\": \"thinking\",\n          \"component\": \"ThinkingBar\",\n          \"text\": \"Reading the quarterly report…\",\n          \"status\": \"thinking\",\n          \"details\": \"Comparing revenue across the last four quarters.\"\n        },\n        {\n          \"id\": \"search\",\n          \"component\": \"ToolCall\",\n          \"name\": \"search_documents\",\n          \"title\": \"Searching the knowledge base\",\n          \"status\": \"success\",\n          \"arguments\": \"{\\\"query\\\": \\\"revenue 2025\\\"}\",\n          \"result\": \"3 documents found\"\n        }\n      ]\n    }\n  }\n]\n```\n\n## Example: confirmation\n\n```json\n[\n  {\n    \"version\": \"v1.0\",\n    \"createSurface\": {\n      \"surfaceId\": \"confirm-delete\",\n      \"catalogId\": \"https://flutter.dev/catalogs/agent/v1/catalog.json\",\n      \"components\": [\n        {\n          \"id\": \"root\",\n          \"component\": \"HumanConfirm\",\n          \"title\": \"Delete the draft?\",\n          \"message\": \"The draft and its revisions will be removed. This cannot be undone.\",\n          \"severity\": \"danger\",\n          \"confirmLabel\": \"Delete\",\n          \"cancelLabel\": \"Keep it\",\n          \"confirmAction\": {\n            \"event\": {\n              \"name\": \"delete_confirmed\",\n              \"context\": {\"draftId\": {\"@path\": \"/draft/id\"}}\n            }\n          },\n          \"cancelAction\": {\n            \"event\": {\"name\": \"delete_cancelled\"}\n          }\n        }\n      ],\n      \"dataModel\": {\"draft\": {\"id\": \"d-42\"}}\n    }\n  }\n]\n```",
+  "components": {
+    "ThinkingBar": {
+      "type": "object",
+      "description": "A compact strip that reports what the agent is doing, with an optional expansion for its reasoning or progress details. Use one ThinkingBar per step, updated in place as the step advances, rather than one per message.",
+      "properties": {
+        "component": {
+          "const": "ThinkingBar"
+        },
+        "text": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "The status line, in one short sentence, such as 'Thinking…' or 'Searching the knowledge base…'."
+        },
+        "status": {
+          "type": "string",
+          "description": "The state of the work the bar reports. 'thinking' animates a progress indicator, 'done' shows a check, and 'error' shows a failure icon.",
+          "enum": ["thinking", "done", "error"],
+          "default": "thinking"
+        },
+        "details": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "The reasoning or progress details, revealed when the user expands the bar. Markdown is not interpreted; keep to plain sentences or short lines. Omit it when there is nothing to expand."
+        },
+        "detailsLabel": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "The accessibility label and tooltip of the control that expands 'details'. Defaults to 'Show details' while collapsed and 'Hide details' while expanded."
+        },
+        "weight": {
+          "type": "number",
+          "description": "The relative weight of this component within a Row or Column. This is similar to the CSS 'flex-grow' property. Note: this may ONLY be set when the component is a direct descendant of a Row or Column."
+        }
+      },
+      "required": ["component", "text"]
+    },
+    "ToolCall": {
+      "type": "object",
+      "description": "One tool invocation: the tool's name, its state, and the arguments and result it carried. The arguments and result are collapsed until the user expands the row, so long payloads are fine.",
+      "properties": {
+        "component": {
+          "const": "ToolCall"
+        },
+        "name": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "The tool's name as the agent knows it, such as 'search_documents'. Shown when no 'title' is given."
+        },
+        "title": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "A human-readable title for the invocation, such as 'Searching the knowledge base'. Defaults to 'name'."
+        },
+        "status": {
+          "type": "string",
+          "description": "The state of the invocation. 'pending' is queued, 'running' animates a progress indicator, 'success' shows a check and 'error' shows a failure icon.",
+          "enum": ["pending", "running", "success", "error"],
+          "default": "running"
+        },
+        "statusText": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "Replaces the default status caption ('Queued', 'Running', 'Completed', 'Failed'), for example to report 'Retrying (2 of 3)'."
+        },
+        "arguments": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "The arguments the tool was called with, as text. Encode structured arguments as a JSON string. Omit when the tool takes none."
+        },
+        "result": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "What the tool returned, as text. Encode structured results as a JSON string; summarize large payloads instead of including them whole. Omit until there is a result."
+        },
+        "icon": {
+          "type": "string",
+          "description": "An icon that hints at the tool's kind; defaults to a tool icon. Use the name that matches what the tool does.",
+          "enum": [
+            "attachFile",
+            "calendarToday",
+            "code",
+            "delete",
+            "download",
+            "edit",
+            "event",
+            "folder",
+            "link",
+            "locationOn",
+            "mail",
+            "payment",
+            "person",
+            "photo",
+            "search",
+            "send",
+            "settings",
+            "shoppingCart",
+            "upload"
+          ],
+          "default": "settings"
+        },
+        "weight": {
+          "type": "number",
+          "description": "The relative weight of this component within a Row or Column. This is similar to the CSS 'flex-grow' property. Note: this may ONLY be set when the component is a direct descendant of a Row or Column."
+        }
+      },
+      "required": ["component", "name"]
+    },
+    "HumanConfirm": {
+      "type": "object",
+      "description": "A card that asks the user to approve or reject an action before the agent takes it. Both decisions dispatch an action event, so give 'cancelAction' an event name of its own unless cancelling needs no reply.",
+      "properties": {
+        "component": {
+          "const": "HumanConfirm"
+        },
+        "title": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "The question to answer, in one short sentence, such as 'Delete the draft?'."
+        },
+        "message": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "What happens next, and what the user gives up by confirming. Keep it to a few sentences."
+        },
+        "severity": {
+          "type": "string",
+          "description": "The tone of the card. 'info' asks an ordinary question, 'warning' flags a consequence, and 'danger' flags an irreversible or destructive action.",
+          "enum": ["info", "warning", "danger"],
+          "default": "info"
+        },
+        "confirmLabel": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "The label of the confirming button. Name the action, such as 'Delete', rather than 'OK'. Defaults to 'Confirm'."
+        },
+        "cancelLabel": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "The label of the declining button. Defaults to 'Cancel'."
+        },
+        "confirmAction": {
+          "$ref": "common_types.json#/$defs/Action",
+          "description": "The action dispatched when the user confirms. Use an 'event' whose name says what was approved, with a context holding the identifiers the agent needs."
+        },
+        "cancelAction": {
+          "$ref": "common_types.json#/$defs/Action",
+          "description": "The action dispatched when the user declines. When omitted, the declining button is disabled."
+        },
+        "weight": {
+          "type": "number",
+          "description": "The relative weight of this component within a Row or Column. This is similar to the CSS 'flex-grow' property. Note: this may ONLY be set when the component is a direct descendant of a Row or Column."
+        }
+      },
+      "required": ["component", "title", "confirmAction"]
+    }
+  },
+  "$defs": {
+    "anyComponent": {
+      "oneOf": [
+        {
+          "$ref": "#/components/ThinkingBar"
+        },
+        {
+          "$ref": "#/components/ToolCall"
+        },
+        {
+          "$ref": "#/components/HumanConfirm"
+        }
+      ],
+      "discriminator": {
+        "propertyName": "component"
+      }
+    },
+    "anyFunction": {
+      "not": {}
+    }
+  }
+}

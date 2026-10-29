@@ -25,16 +25,16 @@ conversation (`context_id`) and the Task the next message continues
   ```
 
   From an AgentScope source checkout, use `uv sync --extra a2a` instead.
-- A DashScope API key for the server's model.
+- A `DEEPSAKE_API_KEY` for the server's configured model.
 
 ## Run it
 
 In one terminal:
 
 ```bash
-export DASHSCOPE_API_KEY=sk-...
+export DEEPSAKE_API_KEY=...
 python server.py                 # http://127.0.0.1:9999
-python server.py --port 8080 --model qwen3.7-max
+python server.py --port 8080 --model deepsake-flash
 ```
 
 In another:
@@ -46,6 +46,28 @@ python client.py --url http://127.0.0.1:8080 --verbosity debug
 
 Type a message and the reply streams back through A2A artifact chunks. `exit`,
 `quit` or Ctrl+D leaves the console.
+
+## A2UI activity and human confirmation
+
+The AgentCard advertises the A2UI v1.0 extension
+(`https://a2ui.org/a2a-extension/a2ui/v1.0`) and the basic and AgentScope
+catalogs. The server emits A2UI DataParts (`application/a2ui+json`) only when
+the renderer advertises the AgentScope catalog in
+`message.metadata.a2uiRendererCapabilities.v1.0.supportedCatalogIds`.
+Otherwise, tool confirmations use a plain-text prompt.
+
+Thinking events update a `ThinkingBar` with short status text; model-provided
+thinking text is not sent to the renderer. Tool-call and tool-result events
+update `ToolCall` surfaces with the call arguments, result, and status. When
+AgentScope raises `RequireUserConfirmEvent`, the server pauses the A2A Task in
+`input-required` and displays one `HumanConfirm` card at a time. The renderer
+resumes the Task by sending an A2UI `action` DataPart whose event name is
+`agentscope.tool.confirm` or `agentscope.tool.reject` and whose context contains
+the `toolCallId`. A plain-text client can instead reply exactly `yes` or `no`.
+
+The included `A2AAgent` console adapter sends text messages; it does not yet
+provide an A2UI renderer or transmit A2UI action DataParts. Use an A2UI-capable
+renderer to exercise the custom activity surfaces and button-based confirmation.
 
 ## How the two sides map onto each other
 
@@ -137,8 +159,11 @@ agent = A2AAgent(card, state=A2AAgentState(context_id=stored_context_id))
 ## Content support
 
 Text, raw bytes and URL Parts map to AgentScope text/data blocks in both
-directions. Structured-data Parts, thinking/tool/hint blocks and push
-notifications are not supported.
+directions. The server additionally publishes A2UI activity and confirmation
+surfaces over A2A DataParts. The `A2AAgent` client adapter does not currently
+interpret A2UI surfaces or submit renderer actions. Other structured-data
+Parts, thinking/tool/hint blocks and push notifications are not supported by
+the adapter.
 
 `compress_context()` is intentionally a no-op: the remote server, not the
 local adapter, owns and compresses its conversation context.

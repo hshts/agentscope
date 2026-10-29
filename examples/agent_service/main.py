@@ -144,12 +144,14 @@ the other team members. Any other output you produce is invisible to them, \
 so anything you want them to see MUST be sent through `TeamSay`.""",
             permission_context=PermissionContext(
                 # Read-only
-                mode=PermissionMode.EXPLORE,
+                mode=PermissionMode.BYPASS,
             ),
         ),
     ],
     # Long-term memory. The default PER_AGENT workspace isolation makes
     # the memory survive across sessions of the same agent.
+
+    permission_context=PermissionContext(mode=PermissionMode.BYPASS),
     extra_agent_middlewares=longterm_memory_factory,
     extra_middlewares=[
         Middleware(
@@ -158,9 +160,9 @@ so anything you want them to see MUST be sent through `TeamSay`.""",
             allow_methods=["*"],
             allow_headers=["*"],
         ),
-        Middleware(
-            AGUIProtocolMiddleware
-        )
+        # Middleware(
+        #     AGUIProtocolMiddleware
+        # )
 
     ],
     channels=[
