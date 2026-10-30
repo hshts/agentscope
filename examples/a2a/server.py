@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """Expose an AgentScope agent as an A2A 1.0 server with A2UI 1.0 output.
 
-The reply streams as A2A artifacts: plain text goes out as text parts, and
-any ``<a2ui-json>`` block the model emits is parsed with the ``a2ui`` SDK and
-sent as an A2UI 1.0 DataPart. Agent activity (thinking, tool calls, human
-confirmation) is published as custom-catalog surfaces. Human confirmation
-pauses the A2A Task in ``input-required`` until the renderer sends an A2UI
-action. Each A2A ``context_id`` gets its own AgentScope agent. Run with::
+The reply streams as A2A messages (agent ``Message`` objects attached to
+``working`` status updates) instead of artifacts: plain text goes out as text
+parts, and any ``<a2ui-json>`` block the model emits is parsed with the
+``a2ui`` SDK and sent as an A2UI 1.0 DataPart. Agent activity (thinking,
+tool calls, human confirmation) is also published as message parts using the
+custom-catalog surfaces. Human confirmation pauses the A2A Task in
+``input-required`` until the renderer sends an A2UI action. Each A2A
+``context_id`` gets its own AgentScope agent. Run with::
 
     export DEEPSAKE_API_KEY=...
     python server.py [--model deepsake-flash] [--port 9999]
@@ -17,7 +19,8 @@ import json
 import logging
 import os
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncGenerator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -26,6 +29,8 @@ from google.protobuf import json_format, struct_pb2
 from pydantic import SecretStr
 import uvicorn
 
+from a2a.compat.v0_3 import types as types_v03
+from a2a.compat.v0_3.conversions import to_core_part
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
@@ -48,7 +53,6 @@ from starlette.middleware.cors import CORSMiddleware
 
 from agentscope.agent import Agent
 from agentscope.credential import DeepSeekCredential
-from agentscope.model import DeepSeekChatModel
 from agentscope.event import (
     ConfirmResult,
     RequireUserConfirmEvent,
@@ -63,8 +67,10 @@ from agentscope.event import (
     ToolResultTextDeltaEvent,
     UserConfirmResultEvent,
 )
+from agentscope.mcp import MCPClient, StdioMCPConfig
 from agentscope.message import Msg, ToolCallBlock, UserMsg
-
+from agentscope.model import DeepSeekChatModel
+from agentscope.tool import Bash, Edit, Glob, Read, Toolkit, Write
 
 from a2ui.constants import A2UI_ACTIONS_KEY, A2UI_CLIENT_CAPABILITIES_KEY
 from a2ui.core.basic_catalog import BasicCatalog
@@ -72,11 +78,6 @@ from a2ui.core.schema import ProtocolVersion
 from a2ui.inference_formats import to_message_dicts
 from a2ui.parser import A2uiPart, Parser, ResponsePart, TextPart
 from a2ui.processor import A2uiGenerator, CatalogConfig
-
-
-from agentscope.mcp import MCPClient, StdioMCPConfig
-
-
 
 
 A2UI_VERSION = "v1.0"
@@ -120,15 +121,21 @@ def _create_a2ui_part(message: dict[str, Any]) -> Part:
             {"mimeType": A2UI_MIME_TYPE},
             struct_pb2.Struct(),
         ),
+        media_type=A2UI_MIME_TYPE,
     )
 
 
-def _a2ui_payload(part: Part) -> Any:
-    """Return the JSON payload of an A2UI DataPart, or None for other parts."""
+def _a2ui_payload(part: Part | types_v03.Part | None) -> Any:
+    """Return the JSON payload of a 1.0 or legacy 0.3 A2UI DataPart."""
+    if part is None:
+        return None
+    if isinstance(part, types_v03.Part):
+        part = to_core_part(part)
     if part.WhichOneof("content") != "data":
         return None
     metadata = json_format.MessageToDict(part.metadata)
-    if metadata.get("mimeType") not in A2UI_MIME_TYPES:
+    mime_type = metadata.get("mimeType") or part.media_type
+    if mime_type not in A2UI_MIME_TYPES:
         return None
     return json_format.MessageToDict(part.data)
 
@@ -293,6 +300,22 @@ def _is_confirmation_action(action: dict[str, Any]) -> bool:
     return action["name"] in (CONFIRM_ACTION, REJECT_ACTION)
 
 
+def _is_stale_confirmation_action(
+    pending: _PendingConfirmation,
+    action: dict[str, Any],
+) -> bool:
+    """Whether an action references a tool call outside the pending event."""
+    tool_call_id = action["context"].get("toolCallId")
+    return (
+        isinstance(tool_call_id, str)
+        and bool(tool_call_id)
+        and all(
+            call.id != tool_call_id
+            for call in pending.event.tool_calls
+        )
+    )
+
+
 def _confirmation_result(
     pending: _PendingConfirmation,
     actions: list[dict[str, Any]],
@@ -308,6 +331,20 @@ def _confirmation_result(
         if action["name"] not in (CONFIRM_ACTION, REJECT_ACTION):
             raise ValueError(f"Unsupported confirmation action: {action['name']}")
         tool_call_id = action["context"].get("toolCallId")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            tool_call_id = next(
+                (
+                    call.id
+                    for call in tool_calls
+                    if call.id not in pending.results
+                ),
+                None,
+            )
+            logger.warning(
+                "Confirmation action %r omitted toolCallId; using the "
+                "currently displayed tool call.",
+                action["name"],
+            )
         confirmed = action["name"] == CONFIRM_ACTION
     else:
         answer = text_input.strip().casefold()
@@ -335,6 +372,21 @@ def _confirmation_result(
         raise ValueError("This tool call has already been confirmed.")
 
     return ConfirmResult(confirmed=confirmed, tool_call=tool_call)
+
+
+async def _emit_agent_message(
+    updater: TaskUpdater,
+    parts: Sequence[Part],
+    extensions: Sequence[str] = (),
+) -> None:
+    """Send agent output as an A2A Message on a working status update."""
+    message = updater.new_agent_message(list(parts))
+    if extensions:
+        message.extensions.extend(extensions)
+    await updater.update_status(
+        TaskState.TASK_STATE_WORKING,
+        message=message,
+    )
 
 
 def _stable_surface_id(kind: str, context_id: str, item_id: str = "") -> str:
@@ -414,6 +466,7 @@ class AgentScopeExecutor(AgentExecutor):
         self._model = model
         self._api_key = api_key
         self._agents: dict[str, Agent] = {}
+        self._mcp_clients: dict[str, MCPClient] = {}
         self._pending_confirmations: dict[str, _PendingConfirmation] = {}
         self._a2ui_surfaces: dict[str, set[str]] = {}
         self._a2ui_contexts: set[str] = set()
@@ -456,7 +509,7 @@ class AgentScopeExecutor(AgentExecutor):
         """Create or update a custom-catalog component surface."""
         surfaces = self._a2ui_surfaces.setdefault(context_id, set())
         if surface_id in surfaces:
-            message = {
+            envelope = {
                 "version": A2UI_VERSION,
                 "updateComponents": {
                     "surfaceId": surface_id,
@@ -464,7 +517,7 @@ class AgentScopeExecutor(AgentExecutor):
                 },
             }
         else:
-            message = {
+            envelope = {
                 "version": A2UI_VERSION,
                 "createSurface": {
                     "surfaceId": surface_id,
@@ -472,34 +525,67 @@ class AgentScopeExecutor(AgentExecutor):
                     "components": [component],
                 },
             }
-        await updater.add_artifact(
-            [_create_a2ui_part(message)],
-            artifact_id=f"{updater.task_id}-a2ui-{uuid.uuid4().hex}",
-            name="A2UI agent activity",
-            last_chunk=True,
+        await _emit_agent_message(
+            updater,
+            [_create_a2ui_part(envelope)],
             extensions=[A2UI_EXTENSION_URI],
         )
         surfaces.add(surface_id)
 
-
-    async def _build_agent(self, supports_a2ui: bool) -> Agent:
-        """Build the agent with the A2UI prompt snippet when the UI is active."""
-        return Agent(
-            name="Friday",
-            system_prompt=(
-                INSTRUCTION
-                if supports_a2ui
-                else "You are a helpful assistant named Friday."
-            ),
-            model=DeepSeekChatModel(
-                credential=DeepSeekCredential(
-                    api_key=SecretStr(self._api_key),
+    async def _build_agent(
+        self,
+        context_id: str,
+        supports_a2ui: bool,
+    ) -> Agent:
+        """Build an agent with local tools and an isolated Playwright MCP."""
+        workdir = str(Path.cwd().resolve())
+        try:
+            toolkit = Toolkit(
+                tools=[
+                    Bash(cwd=workdir),
+                    Read(),
+                    Write(),
+                    Edit(),
+                    Glob(),
+                ],
+            )
+            agent = Agent(
+                name="Friday",
+                system_prompt="\n\n".join([
+                    (
+                        INSTRUCTION
+                        if supports_a2ui
+                        else "You are a helpful assistant named Friday."
+                    ),
+                    f"The local working directory is {workdir}.",
+                    (
+                        "Use Bash, Read, Write, Edit, and Glob for local "
+                        "development tasks. Use Playwright only for websites "
+                        "and applications the user is authorized to test. "
+                        "Do not submit forms or perform consequential actions "
+                        "without the user's explicit approval."
+                    ),
+                ]),
+                model=DeepSeekChatModel(
+                    credential=DeepSeekCredential(
+                        api_key=SecretStr(self._api_key),
+                    ),
+                    model=self._model,
+                    stream=True,
                 ),
-                model=self._model,
-                stream=True,
-            ),
+                toolkit=toolkit,
+            )
+        except BaseException:
+            raise
 
-        )
+        return agent
+
+    async def aclose(self) -> None:
+        """Close all per-conversation MCP connections."""
+        clients = list(self._mcp_clients.values())
+        self._mcp_clients.clear()
+        for client in clients:
+            await client.close()
 
     async def _show_confirmation(
         self,
@@ -556,7 +642,7 @@ class AgentScopeExecutor(AgentExecutor):
 
         agent = self._agents.get(context_id)
         if agent is None:
-            agent = await self._build_agent(supports_a2ui)
+            agent = await self._build_agent(context_id, supports_a2ui)
             self._agents[context_id] = agent
 
         if context.current_task is None:
@@ -590,13 +676,37 @@ class AgentScopeExecutor(AgentExecutor):
             return
 
         if pending_confirmation is not None:
+            confirmation_actions = [
+                action
+                for action in actions
+                if _is_confirmation_action(action)
+            ]
+            if confirmation_actions and _is_stale_confirmation_action(
+                pending_confirmation,
+                confirmation_actions[0],
+            ):
+                action_tool_call_id = confirmation_actions[0][
+                    "context"
+                ]["toolCallId"]
+                pending_tool_call_ids = {
+                    call.id for call in pending_confirmation.event.tool_calls
+                }
+                logger.warning(
+                    "Ignoring stale confirmation for toolCallId %r; "
+                    "pending toolCallIds are %s.",
+                    action_tool_call_id,
+                    sorted(pending_tool_call_ids),
+                )
+                await self._show_confirmation(
+                    context_id,
+                    updater,
+                    pending_confirmation,
+                    supports_a2ui,
+                )
+                return
             result = _confirmation_result(
                 pending_confirmation,
-                [
-                    action
-                    for action in actions
-                    if _is_confirmation_action(action)
-                ],
+                confirmation_actions,
                 context.get_user_input(),
             )
             pending_confirmation.results[result.tool_call.id] = result
@@ -646,10 +756,6 @@ class AgentScopeExecutor(AgentExecutor):
                 user_input = _action_query(actions, user_input)
             agent_input = UserMsg(name="user", content=user_input)
 
-        text_artifact_id = f"{task_id}-reply-{uuid.uuid4().hex}"
-        ui_artifact_id = f"{task_id}-ui-{uuid.uuid4().hex}"
-        text_started = False
-        ui_started = False
         parser = _create_parser() if supports_a2ui else None
         streaming = bool(
             parser is not None
@@ -659,28 +765,17 @@ class AgentScopeExecutor(AgentExecutor):
         buffered = ""
 
         async def emit_part(part: Part) -> None:
-            """Send one response part on the artifact its media type belongs to."""
-            nonlocal text_started, ui_started
+            """Send one response part as an agent message."""
             if part.WhichOneof("content") == "text":
                 if not part.text:
                     return
-                await updater.add_artifact(
-                    [part],
-                    artifact_id=text_artifact_id,
-                    append=text_started,
-                    last_chunk=False,
-                )
-                text_started = True
+                await _emit_agent_message(updater, [part])
                 return
-            await updater.add_artifact(
+            await _emit_agent_message(
+                updater,
                 [part],
-                artifact_id=ui_artifact_id,
-                name="A2UI response",
-                append=ui_started,
-                last_chunk=False,
                 extensions=[A2UI_EXTENSION_URI],
             )
-            ui_started = True
 
         async def emit_text(text: str) -> None:
             """Stream model text, splitting out the A2UI blocks it carries."""
@@ -778,14 +873,6 @@ class AgentScopeExecutor(AgentExecutor):
         if parser is not None and not streaming and buffered:
             for part in _to_a2a_parts(_processor.parse_response(buffered)):
                 await emit_part(part)
-        if text_started:
-            # append=True keeps the streamed chunks: append=False replaces them.
-            await updater.add_artifact(
-                [],
-                artifact_id=text_artifact_id,
-                append=True,
-                last_chunk=True,
-            )
 
         if confirmation_event is None:
             if supports_a2ui:
@@ -858,8 +945,17 @@ def create_app(
     configured with.
     """
     card = _create_agent_card(base_url)
+    executor = AgentScopeExecutor(card=card, model=model, api_key=api_key)
+
+    @asynccontextmanager
+    async def lifespan(_: Starlette) -> AsyncGenerator[None, None]:
+        try:
+            yield
+        finally:
+            await executor.aclose()
+
     handler = DefaultRequestHandler(
-        agent_executor=AgentScopeExecutor(card=card, model=model, api_key=api_key),
+        agent_executor=executor,
         task_store=InMemoryTaskStore(),
         agent_card=card,
     )
@@ -882,6 +978,7 @@ def create_app(
                 max_age=600,
             ),
         ],
+        lifespan=lifespan,
     )
 
 

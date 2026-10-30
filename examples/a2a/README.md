@@ -18,6 +18,8 @@ conversation (`context_id`) and the Task the next message continues
 ## Prerequisites
 
 - Python 3.11 or newer
+- Node.js with `npx` available (the Playwright MCP server is launched on
+  demand)
 - AgentScope with the A2A extra:
 
   ```bash
@@ -44,8 +46,8 @@ python client.py
 python client.py --url http://127.0.0.1:8080 --verbosity debug
 ```
 
-Type a message and the reply streams back through A2A artifact chunks. `exit`,
-`quit` or Ctrl+D leaves the console.
+Type a message and the reply streams back as agent `Message` objects attached
+to A2A task status updates. `exit`, `quit` or Ctrl+D leaves the console.
 
 ## A2UI activity and human confirmation
 
@@ -64,6 +66,15 @@ AgentScope raises `RequireUserConfirmEvent`, the server pauses the A2A Task in
 resumes the Task by sending an A2UI `action` DataPart whose event name is
 `agentscope.tool.confirm` or `agentscope.tool.reject` and whose context contains
 the `toolCallId`. A plain-text client can instead reply exactly `yes` or `no`.
+Text, thinking, tool-call, and A2UI parts are sent in agent `Message` objects
+on `working` status updates; the server does not publish reply or activity
+artifacts.
+
+The agent also has `Bash`, `Read`, `Write`, `Edit`, and `Glob` tools. Bash
+starts in the server's current working directory. A per-conversation
+Playwright MCP server is launched with an isolated browser profile. Tool calls
+requiring permission pause the Task for user confirmation. Use Playwright only
+with websites and applications you are authorized to test.
 
 The included `A2AAgent` console adapter sends text messages; it does not yet
 provide an A2UI renderer or transmit A2UI action DataParts. Use an A2UI-capable
@@ -74,8 +85,8 @@ renderer to exercise the custom activity surfaces and button-based confirmation.
 **Server** (`AgentScopeExecutor`). One AgentScope `Agent` per A2A
 `context_id`, so concurrent conversations stay independent. Each reply
 enqueues the `Task`, moves it to `WORKING`, publishes every
-`TextBlockDeltaEvent` as an artifact chunk (the last one marked
-`last_chunk=True`), and completes the Task.
+`TextBlockDeltaEvent` and activity part as an agent `Message` on a status
+update, and completes the Task.
 
 **Client** (`A2AAgent`). Every A2A Part of a response becomes one content
 block — text Parts become `TextBlock`, raw byte and URL Parts become
