@@ -530,7 +530,7 @@ class AgentScopeExecutor(AgentExecutor):
             [_create_a2ui_part(envelope)],
             extensions=[A2UI_EXTENSION_URI],
         )
-        surfaces.add(surface_id)
+        self._a2ui_surfaces[context_id].add(surface_id)
 
     async def _build_agent(
         self,
@@ -617,9 +617,10 @@ class AgentScopeExecutor(AgentExecutor):
                 _stable_surface_id("confirm", context_id, tool_call.id),
                 _human_confirm_component(tool_call),
             )
-        await updater.requires_input(
+        else:
+            await updater.requires_input(
             updater.new_agent_message([Part(text=prompt)]),
-        )
+          )
 
     async def execute(
         self,
@@ -815,7 +816,7 @@ class AgentScopeExecutor(AgentExecutor):
                     await self._emit_component(
                         context_id,
                         updater,
-                        _stable_surface_id("thinking", context_id),
+                        _stable_surface_id("thinking", context_id,event.reply_id),
                         _thinking_component("Thinking…", "thinking"),
                     )
             elif isinstance(event, ToolCallStartEvent):
@@ -879,7 +880,7 @@ class AgentScopeExecutor(AgentExecutor):
                 await self._emit_component(
                     context_id,
                     updater,
-                    _stable_surface_id("thinking", context_id),
+                    _stable_surface_id("thinking", task_id),
                     _thinking_component("Response ready", "done"),
                 )
             await updater.complete()
@@ -903,7 +904,7 @@ class AgentScopeExecutor(AgentExecutor):
             await self._emit_component(
                 context_id,
                 updater,
-                _stable_surface_id("thinking", context_id),
+                _stable_surface_id("thinking", task_id),
                 _thinking_component("Waiting for your confirmation…", "thinking"),
             )
         await self._show_confirmation(
@@ -1000,7 +1001,7 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
-    api_key = os.environ.get("DEEPSAKE_API_KEY")
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key: 
         raise RuntimeError(
             "Set the DEEPSAKE_API_KEY environment variable before running "
