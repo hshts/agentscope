@@ -61,14 +61,16 @@ Otherwise, tool confirmations use a plain-text prompt.
 Thinking events update a `ThinkingBar` with short status text; model-provided
 thinking text is not sent to the renderer. Tool-call and tool-result events
 update `ToolCall` surfaces with the call arguments, result, and status. When
-AgentScope raises `RequireUserConfirmEvent`, the server pauses the A2A Task in
-`input-required` and displays one `HumanConfirm` card at a time. The renderer
-resumes the Task by sending an A2UI `action` DataPart whose event name is
-`agentscope.tool.confirm` or `agentscope.tool.reject` and whose context contains
-the `toolCallId`. A plain-text client can instead reply exactly `yes` or `no`.
-Text, thinking, tool-call, and A2UI parts are sent in agent `Message` objects
-on `working` status updates; the server does not publish reply or activity
-artifacts.
+AgentScope raises `RequireUserConfirmEvent`, the server parks the A2A Task in
+`input-required` and shows a `HumanConfirm` card for every pending tool call;
+the event itself drives the flow. The renderer resumes the Task by sending an
+A2UI `action` DataPart (or a plain text reply) whose decision is mapped
+directly into a single AgentScope `UserConfirmResultEvent` covering all the
+pending tool calls of that confirmation. The event name must be
+`agentscope.tool.confirm` or `agentscope.tool.reject`; a plain-text client can
+instead reply exactly `yes` or `no`. Text responses are sent in agent `Message`
+objects on `working` status updates, while thinking and activity surfaces
+(including the confirmation cards) are published as A2UI artifact chunks.
 
 The agent also has `Bash`, `Read`, `Write`, `Edit`, and `Glob` tools. Bash
 starts in the server's current working directory. A per-conversation

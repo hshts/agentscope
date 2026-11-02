@@ -21,7 +21,7 @@ import os
 import uuid
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -42,6 +42,7 @@ from a2a.types import (
     AgentExtension,
     AgentInterface,
     AgentSkill,
+    Message,
     Part,
     Task,
     TaskState,
@@ -52,12 +53,17 @@ from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 
 from agentscope.agent import Agent
-from agentscope.credential import DeepSeekCredential
+from agentscope.model import DeepSeekChatModel,VolcengineChatModel
+from agentscope.credential import DeepSeekCredential,VolcengineCredential
+
 from agentscope.event import (
     ConfirmResult,
     RequireUserConfirmEvent,
+    UserConfirmResultEvent,
     TextBlockDeltaEvent,
     ThinkingBlockStartEvent,
+    ThinkingBlockDeltaEvent,
+    ThinkingBlockEndEvent,
     ToolCallDeltaEvent,
     ToolCallEndEvent,
     ToolCallStartEvent,
@@ -65,11 +71,10 @@ from agentscope.event import (
     ToolResultEndEvent,
     ToolResultStartEvent,
     ToolResultTextDeltaEvent,
-    UserConfirmResultEvent,
+
 )
 from agentscope.mcp import MCPClient, StdioMCPConfig
-from agentscope.message import Msg, ToolCallBlock, UserMsg
-from agentscope.model import DeepSeekChatModel
+from agentscope.message import Msg, ToolCallBlock, ToolCallState, UserMsg
 from agentscope.tool import Bash, Edit, Glob, Read, Toolkit, Write
 
 from a2ui.constants import A2UI_ACTIONS_KEY, A2UI_CLIENT_CAPABILITIES_KEY
@@ -113,10 +118,14 @@ INSTRUCTION = "\n\n".join([
 ])
 
 
-def _create_a2ui_part(message: dict[str, Any]) -> Part:
-    """Encode one A2UI 1.0 message as an A2A DataPart."""
+def _a2ui_to_part(a2ui: Any) -> Part:
+    """Encode one or more A2UI 1.0 messages as an A2A DataPart.
+
+    ``ParseDict`` accepts a dict or a list at runtime, but its type stub
+    only declares ``dict[str, Any]``.
+    """
     return Part(
-        data=json_format.ParseDict(message, struct_pb2.Value()),
+        data=json_format.ParseDict(a2ui, struct_pb2.Value()),
         metadata=json_format.ParseDict(
             {"mimeType": A2UI_MIME_TYPE},
             struct_pb2.Struct(),
@@ -149,7 +158,7 @@ def _to_a2a_parts(response_parts: Sequence[ResponsePart]) -> list[Part]:
                 parts.append(Part(text=response_part.text))
         elif isinstance(response_part, A2uiPart):
             for message in to_message_dicts(response_part.a2ui):
-                parts.append(_create_a2ui_part(message))
+                parts.append(_a2ui_to_part(message))
     return parts
 
 
@@ -211,11 +220,23 @@ def _create_agent_card(base_url: str) -> AgentCard:
     )
 
 
-def _renderer_capabilities(context: RequestContext) -> dict[str, Any] | None:
+def _a2a_message(
+    context_or_message: RequestContext | Message,
+) -> Message | None:
+    """Return the A2A message behind a request context, or the message."""
+    if isinstance(context_or_message, Message):
+        return context_or_message
+    return context_or_message.message
+
+
+def _renderer_capabilities(
+    context_or_message: RequestContext | Message,
+) -> dict[str, Any] | None:
     """Read the renderer's own A2UI capabilities from the message metadata."""
-    if context.message is None:
+    message = _a2a_message(context_or_message)
+    if message is None:
         return None
-    metadata = json_format.MessageToDict(context.message.metadata)
+    metadata = json_format.MessageToDict(message.metadata)
     for key in RENDERER_CAPABILITIES_KEYS:
         capabilities = metadata.get(key)
         if capabilities is None:
@@ -230,12 +251,16 @@ def _renderer_capabilities(context: RequestContext) -> dict[str, Any] | None:
     return None
 
 
-def _renderer_supports_a2ui(context: RequestContext) -> bool:
+def _renderer_supports_a2ui(
+    context_or_message: RequestContext | Message,
+) -> bool:
     """Use A2UI only when the renderer negotiates the extension or the catalog."""
-    if A2UI_EXTENSION_URI in (context.requested_extensions or []):
+    if isinstance(context_or_message, RequestContext) and (
+        A2UI_EXTENSION_URI in (context_or_message.requested_extensions or [])
+    ):
         return True
 
-    capabilities = _renderer_capabilities(context)
+    capabilities = _renderer_capabilities(context_or_message)
     if capabilities is None:
         return False
     version_capabilities = capabilities.get(A2UI_VERSION, {})
@@ -247,13 +272,16 @@ def _renderer_supports_a2ui(context: RequestContext) -> bool:
     return AGENT_CATALOG_ID in supported
 
 
-def _extract_a2ui_actions(context: RequestContext) -> list[dict[str, Any]]:
+def _extract_a2ui_actions(
+    context_or_message: RequestContext | Message,
+) -> list[dict[str, Any]]:
     """Read renderer actions from the A2UI DataParts in the A2A message."""
-    if context.message is None:
+    message = _a2a_message(context_or_message)
+    if message is None:
         return []
 
     actions: list[dict[str, Any]] = []
-    for part in context.message.parts:
+    for part in message.parts:
         payload = _a2ui_payload(part)
         if payload is None:
             continue
@@ -287,106 +315,6 @@ def _action_query(actions: list[dict[str, Any]], text_input: str) -> str:
         lines.append(text_input.strip())
     return "\n".join(lines)
 
-
-@dataclass
-class _PendingConfirmation:
-    event: RequireUserConfirmEvent
-    task_id: str = ""
-    results: dict[str, ConfirmResult] = field(default_factory=dict)
-
-
-def _is_confirmation_action(action: dict[str, Any]) -> bool:
-    """Whether an action decides a pending tool confirmation."""
-    return action["name"] in (CONFIRM_ACTION, REJECT_ACTION)
-
-
-def _is_stale_confirmation_action(
-    pending: _PendingConfirmation,
-    action: dict[str, Any],
-) -> bool:
-    """Whether an action references a tool call outside the pending event."""
-    tool_call_id = action["context"].get("toolCallId")
-    return (
-        isinstance(tool_call_id, str)
-        and bool(tool_call_id)
-        and all(
-            call.id != tool_call_id
-            for call in pending.event.tool_calls
-        )
-    )
-
-
-def _confirmation_result(
-    pending: _PendingConfirmation,
-    actions: list[dict[str, Any]],
-    text_input: str,
-) -> ConfirmResult:
-    """Map one renderer action (or an explicit yes/no) to AgentScope HITL."""
-    if len(actions) > 1:
-        raise ValueError("Send one tool confirmation action per A2A message.")
-
-    tool_calls = pending.event.tool_calls
-    if actions:
-        action = actions[0]
-        if action["name"] not in (CONFIRM_ACTION, REJECT_ACTION):
-            raise ValueError(f"Unsupported confirmation action: {action['name']}")
-        tool_call_id = action["context"].get("toolCallId")
-        if not isinstance(tool_call_id, str) or not tool_call_id:
-            tool_call_id = next(
-                (
-                    call.id
-                    for call in tool_calls
-                    if call.id not in pending.results
-                ),
-                None,
-            )
-            logger.warning(
-                "Confirmation action %r omitted toolCallId; using the "
-                "currently displayed tool call.",
-                action["name"],
-            )
-        confirmed = action["name"] == CONFIRM_ACTION
-    else:
-        answer = text_input.strip().casefold()
-        if answer not in {"yes", "y", "approve", "allow", "no", "n", "reject"}:
-            raise ValueError(
-                "Reply with an A2UI confirmation action or an explicit yes/no.",
-            )
-        tool_call_id = next(
-            (
-                tool_call.id
-                for tool_call in tool_calls
-                if tool_call.id not in pending.results
-            ),
-            None,
-        )
-        confirmed = answer in {"yes", "y", "approve", "allow"}
-
-    tool_call = next(
-        (call for call in tool_calls if call.id == tool_call_id),
-        None,
-    )
-    if tool_call is None:
-        raise ValueError("Confirmation refers to an unknown toolCallId.")
-    if tool_call.id in pending.results:
-        raise ValueError("This tool call has already been confirmed.")
-
-    return ConfirmResult(confirmed=confirmed, tool_call=tool_call)
-
-
-async def _emit_agent_message(
-    updater: TaskUpdater,
-    parts: Sequence[Part],
-    extensions: Sequence[str] = (),
-) -> None:
-    """Send agent output as an A2A Message on a working status update."""
-    message = updater.new_agent_message(list(parts))
-    if extensions:
-        message.extensions.extend(extensions)
-    await updater.update_status(
-        TaskState.TASK_STATE_WORKING,
-        message=message,
-    )
 
 
 def _stable_surface_id(kind: str, context_id: str, item_id: str = "") -> str:
@@ -457,47 +385,41 @@ def _human_confirm_component(tool_call: ToolCallBlock) -> dict[str, Any]:
     }
 
 
+async def _emit_agent_message(
+    updater: TaskUpdater,
+    parts: Sequence[Part],
+    extensions: Sequence[str] = (),
+) -> None:
+    """Send agent output as an A2A Message on a working status update."""
+    message = updater.new_agent_message(list(parts))
+    if extensions:
+        message.extensions.extend(extensions)
+    await updater.update_status(
+        TaskState.TASK_STATE_WORKING,
+        message=message,
+    )
+
+
+
 class AgentScopeExecutor(AgentExecutor):
     """Run one AgentScope agent per A2A context."""
 
-    def __init__(self, card: AgentCard, model: str, api_key: str) -> None:
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        card: AgentCard | None = None,
+    ) -> None:
         """Remember how to build an agent for a new conversation."""
         self._card = card
         self._model = model
         self._api_key = api_key
         self._agents: dict[str, Agent] = {}
         self._mcp_clients: dict[str, MCPClient] = {}
-        self._pending_confirmations: dict[str, _PendingConfirmation] = {}
         self._a2ui_surfaces: dict[str, set[str]] = {}
         self._a2ui_contexts: set[str] = set()
 
-    def _pending_for(
-        self,
-        context_id: str,
-        task_id: str,
-    ) -> _PendingConfirmation | None:
-        """Find the confirmation a renderer action answers.
 
-        The action may arrive on the same context, or on a new one when the
-        renderer drops ``contextId`` and only keeps ``taskId``.
-        """
-        pending = self._pending_confirmations.get(context_id)
-        if pending is not None:
-            return pending
-        return next(
-            (
-                candidate
-                for candidate in self._pending_confirmations.values()
-                if candidate.task_id == task_id
-            ),
-            None,
-        )
-
-    def _clear_pending(self, pending: _PendingConfirmation) -> None:
-        """Forget a confirmation wherever it was stored."""
-        for key, value in list(self._pending_confirmations.items()):
-            if value is pending:
-                del self._pending_confirmations[key]
 
     async def _emit_component(
         self,
@@ -508,6 +430,7 @@ class AgentScopeExecutor(AgentExecutor):
     ) -> None:
         """Create or update a custom-catalog component surface."""
         surfaces = self._a2ui_surfaces.setdefault(context_id, set())
+        envelope = {}
         if surface_id in surfaces:
             envelope = {
                 "version": A2UI_VERSION,
@@ -527,10 +450,71 @@ class AgentScopeExecutor(AgentExecutor):
             }
         await _emit_agent_message(
             updater,
-            [_create_a2ui_part(envelope)],
+            [_a2ui_to_part(envelope)],
             extensions=[A2UI_EXTENSION_URI],
         )
         self._a2ui_surfaces[context_id].add(surface_id)
+
+    async def _emit_confirmation(
+        self,
+        context_id: str,
+        updater: TaskUpdater,
+        confirmation: RequireUserConfirmEvent,
+        supports_a2ui: bool,
+    ) -> None:
+        """Present the confirmation and park the A2A task at input-required."""
+        if supports_a2ui:
+            for tool_call in confirmation.tool_calls:
+                await self._emit_component(
+                    context_id,
+                    updater,
+                    _stable_surface_id("confirm", context_id, tool_call.id),
+                    _human_confirm_component(tool_call),
+                )
+            await updater.requires_input()
+        else:
+            tool_call = confirmation.tool_calls[0]
+            prompt = (
+                f"Allow tool {tool_call.name} with arguments "
+                f"{tool_call.input or '{}'}? Reply yes or no."
+            )
+            await updater.requires_input(
+                updater.new_agent_message([Part(text=prompt)]),
+            )
+
+    async def _emit_delete_surfaces(
+        self,
+        context_id: str,
+        updater: TaskUpdater,
+        confirmresultevent: UserConfirmResultEvent | None,
+    ) -> None:
+        """Remove confirmation cards after their result is accepted."""
+        surfaces = self._a2ui_surfaces.setdefault(context_id, set())
+        for result in confirmresultevent.confirm_results if confirmresultevent is not None else []:
+            surface_id = _stable_surface_id(
+                "confirm",
+                context_id,
+                result.tool_call.id,
+            )
+            if surface_id not in surfaces:
+                continue
+            await _emit_agent_message(
+                updater,
+                [
+                    _a2ui_to_part([
+                        {
+                            "version": A2UI_VERSION,
+                            "deleteSurface": {"surfaceId": surface_id},
+                        },
+                    ]),
+                ],
+                extensions=[A2UI_EXTENSION_URI],
+            )
+            surfaces.remove(surface_id)
+
+
+
+
 
     async def _build_agent(
         self,
@@ -569,6 +553,7 @@ class AgentScopeExecutor(AgentExecutor):
                 model=DeepSeekChatModel(
                     credential=DeepSeekCredential(
                         api_key=SecretStr(self._api_key),
+                        # base_url= "https://api.deepseek.com",
                     ),
                     model=self._model,
                     stream=True,
@@ -580,47 +565,6 @@ class AgentScopeExecutor(AgentExecutor):
 
         return agent
 
-    async def aclose(self) -> None:
-        """Close all per-conversation MCP connections."""
-        clients = list(self._mcp_clients.values())
-        self._mcp_clients.clear()
-        for client in clients:
-            await client.close()
-
-    async def _show_confirmation(
-        self,
-        context_id: str,
-        updater: TaskUpdater,
-        pending: _PendingConfirmation,
-        supports_a2ui: bool,
-    ) -> None:
-        """Present the next undecided tool call."""
-        tool_call = next(
-            (
-                call
-                for call in pending.event.tool_calls
-                if call.id not in pending.results
-            ),
-            None,
-        )
-        if tool_call is None:
-            raise RuntimeError("No undecided tool calls remain.")
-
-        prompt = (
-            f"Allow tool {tool_call.name} with arguments "
-            f"{tool_call.input or '{}'}? Reply yes or no."
-        )
-        if supports_a2ui:
-            await self._emit_component(
-                context_id,
-                updater,
-                _stable_surface_id("confirm", context_id, tool_call.id),
-                _human_confirm_component(tool_call),
-            )
-        else:
-            await updater.requires_input(
-            updater.new_agent_message([Part(text=prompt)]),
-          )
 
     async def execute(
         self,
@@ -640,12 +584,12 @@ class AgentScopeExecutor(AgentExecutor):
         )
         if supports_a2ui:
             self._a2ui_contexts.add(context_id)
-
+        parser = _create_parser() if supports_a2ui else None
+        tool_progress: dict[str, dict[str, str]] = {}
         agent = self._agents.get(context_id)
         if agent is None:
             agent = await self._build_agent(context_id, supports_a2ui)
             self._agents[context_id] = agent
-
         if context.current_task is None:
             await event_queue.enqueue_event(
                 Task(
@@ -656,108 +600,17 @@ class AgentScopeExecutor(AgentExecutor):
             )
         updater = TaskUpdater(event_queue, task_id, context_id)
         await updater.start_work()
-
         actions = _extract_a2ui_actions(context)
-        pending_confirmation = self._pending_for(context_id, task_id)
-        if pending_confirmation is not None and actions and not any(
-            _is_confirmation_action(action) for action in actions
-        ):
-            # A surface action arrived while a tool waits for its decision:
-            # keep the request open and show the card again.
-            logger.warning(
-                "A2UI action(s) %s do not answer the pending tool confirmation.",
-                [action["name"] for action in actions],
-            )
-            await self._show_confirmation(
-                context_id,
-                updater,
-                pending_confirmation,
-                supports_a2ui,
-            )
-            return
-
-        if pending_confirmation is not None:
-            confirmation_actions = [
-                action
-                for action in actions
-                if _is_confirmation_action(action)
-            ]
-            if confirmation_actions and _is_stale_confirmation_action(
-                pending_confirmation,
-                confirmation_actions[0],
-            ):
-                action_tool_call_id = confirmation_actions[0][
-                    "context"
-                ]["toolCallId"]
-                pending_tool_call_ids = {
-                    call.id for call in pending_confirmation.event.tool_calls
-                }
-                logger.warning(
-                    "Ignoring stale confirmation for toolCallId %r; "
-                    "pending toolCallIds are %s.",
-                    action_tool_call_id,
-                    sorted(pending_tool_call_ids),
-                )
-                await self._show_confirmation(
-                    context_id,
-                    updater,
-                    pending_confirmation,
-                    supports_a2ui,
-                )
-                return
-            result = _confirmation_result(
-                pending_confirmation,
-                confirmation_actions,
-                context.get_user_input(),
-            )
-            pending_confirmation.results[result.tool_call.id] = result
-            if supports_a2ui:
-                await self._emit_component(
-                    context_id,
-                    updater,
-                    _stable_surface_id(
-                        "confirm",
-                        context_id,
-                        result.tool_call.id,
-                    ),
-                    _thinking_component(
-                        f"{result.tool_call.name} "
-                        f"{'approved' if result.confirmed else 'rejected'}",
-                        "done",
-                    ),
-                )
-
-            if len(pending_confirmation.results) < len(
-                pending_confirmation.event.tool_calls,
-            ):
-                await self._show_confirmation(
-                    context_id,
-                    updater,
-                    pending_confirmation,
-                    supports_a2ui,
-                )
-                return
-
-            self._clear_pending(pending_confirmation)
-            agent_input: Msg | UserConfirmResultEvent = (
-                UserConfirmResultEvent(
-                    reply_id=pending_confirmation.event.reply_id,
-                    confirm_results=list(pending_confirmation.results.values()),
-                )
-            )
-        else:
-            user_input = context.get_user_input()
-            if actions:
+        user_input = context.get_user_input()
+        if actions:
                 # The renderer clicked a surface the model generated, so the
                 # action is a normal user turn, not a tool decision.
-                logger.info(
-                    "A2UI action(s) without a pending confirmation: %s",
-                    [action["name"] for action in actions],
+            logger.info(
+                "A2UI action(s) without a pending confirmation: %s",
+                 [action["name"] for action in actions],
                 )
-                user_input = _action_query(actions, user_input)
-            agent_input = UserMsg(name="user", content=user_input)
-
-        parser = _create_parser() if supports_a2ui else None
+            user_input = _action_query(actions, user_input)
+        agent_input = UserMsg(name="user", content=user_input)
         streaming = bool(
             parser is not None
             and getattr(parser, "parse_chunk", None)
@@ -790,8 +643,6 @@ class AgentScopeExecutor(AgentExecutor):
             for part in _to_a2a_parts(parser.parse_chunk(text)):
                 await emit_part(part)
 
-        tool_progress: dict[str, dict[str, str]] = {}
-
         async def emit_tool(tool_call_id: str) -> None:
             state = tool_progress[tool_call_id]
             await self._emit_component(
@@ -807,7 +658,8 @@ class AgentScopeExecutor(AgentExecutor):
                 ),
             )
 
-        confirmation_event: RequireUserConfirmEvent | None = None
+
+  
         async for event in agent.reply_stream(agent_input):
             if isinstance(event, TextBlockDeltaEvent):
                 await emit_text(event.delta)
@@ -816,9 +668,26 @@ class AgentScopeExecutor(AgentExecutor):
                     await self._emit_component(
                         context_id,
                         updater,
-                        _stable_surface_id("thinking", context_id,event.reply_id),
+                        _stable_surface_id(event.block_id, context_id,event.reply_id),
                         _thinking_component("Thinking…", "thinking"),
                     )
+            elif isinstance(event, ThinkingBlockDeltaEvent):
+                if supports_a2ui:
+                    # await self._emit_component(
+                    #     context_id,
+                    #     updater,
+                    #     _stable_surface_id(event.block_id, context_id,event.reply_id),
+                    #     _thinking_component(event.delta, "thinking"),
+                    #     )
+                    await emit_text(event.delta)
+            elif isinstance(event, ThinkingBlockEndEvent):
+                if supports_a2ui:
+                    await self._emit_component(
+                        context_id,
+                        updater,
+                        _stable_surface_id(event.block_id, context_id,event.reply_id),
+                        _thinking_component("Thinking Done", "done"),
+                        )           
             elif isinstance(event, ToolCallStartEvent):
                 tool_progress[event.tool_call_id] = {
                     "name": event.tool_call_name,
@@ -868,51 +737,35 @@ class AgentScopeExecutor(AgentExecutor):
                     if supports_a2ui:
                         await emit_tool(event.tool_call_id)
             elif isinstance(event, RequireUserConfirmEvent):
-                confirmation_event = event
-                break
+                for tool_call in event.tool_calls:
+                    tool_progress[tool_call.id] = {
+                        "name": tool_call.name,
+                        "status": "pending",
+                        "arguments": tool_call.input,
+                        "result": "",
+                    }
+                    if supports_a2ui:
+                        await emit_tool(tool_call.id)
+                await self._emit_confirmation(
+                    context_id,
+                    updater,
+                    event,
+                    supports_a2ui,
+                )
+            elif isinstance(event, UserConfirmResultEvent):
+                if supports_a2ui:
+                    await self._emit_delete_surfaces(
+                        updater=updater,
+                        context_id=context_id, 
+                        confirmresultevent=event )
+               
+
+
 
         if parser is not None and not streaming and buffered:
             for part in _to_a2a_parts(_processor.parse_response(buffered)):
                 await emit_part(part)
 
-        if confirmation_event is None:
-            if supports_a2ui:
-                await self._emit_component(
-                    context_id,
-                    updater,
-                    _stable_surface_id("thinking", task_id),
-                    _thinking_component("Response ready", "done"),
-                )
-            await updater.complete()
-            return
-
-        pending_confirmation = _PendingConfirmation(
-            event=confirmation_event,
-            task_id=task_id,
-        )
-        self._pending_confirmations[context_id] = pending_confirmation
-        for tool_call in confirmation_event.tool_calls:
-            tool_progress[tool_call.id] = {
-                "name": tool_call.name,
-                "status": "pending",
-                "arguments": tool_call.input,
-                "result": "",
-            }
-            if supports_a2ui:
-                await emit_tool(tool_call.id)
-        if supports_a2ui:
-            await self._emit_component(
-                context_id,
-                updater,
-                _stable_surface_id("thinking", task_id),
-                _thinking_component("Waiting for your confirmation…", "thinking"),
-            )
-        await self._show_confirmation(
-            context_id,
-            updater,
-            pending_confirmation,
-            supports_a2ui,
-        )
 
     async def cancel(
         self,
@@ -922,15 +775,19 @@ class AgentScopeExecutor(AgentExecutor):
         """Mark the Task canceled at the client's request."""
         if context.task_id is None or context.context_id is None:
             raise RuntimeError("Cannot cancel a Task without IDs.")
-        pending = self._pending_for(context.context_id, context.task_id)
-        if pending is not None:
-            self._clear_pending(pending)
-        self._pending_confirmations.pop(context.context_id, None)
         await TaskUpdater(
             event_queue,
             context.task_id,
             context.context_id,
         ).cancel()
+
+    async def aclose(self) -> None:
+        """Close all per-conversation MCP connections."""
+        clients = list(self._mcp_clients.values())
+        self._mcp_clients.clear()
+        for client in clients:
+            await client.close()
+
 
 
 def create_app(
@@ -1004,7 +861,7 @@ async def main() -> None:
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key: 
         raise RuntimeError(
-            "Set the DEEPSAKE_API_KEY environment variable before running "
+            "Set the DEEPSEEK_API_KEY environment variable before running "
             "this demo.",
         )
 

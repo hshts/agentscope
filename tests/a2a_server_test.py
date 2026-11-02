@@ -31,7 +31,7 @@ from agentscope.event import (
     ToolResultTextDeltaEvent,
     UserConfirmResultEvent,
 )
-from agentscope.message import ToolCallBlock, ToolResultState
+from agentscope.message import ToolCallBlock, ToolCallState, ToolResultState
 from examples.a2a.server import (
     A2UI_EXTENSION_URI,
     A2UI_MIME_TYPE,
@@ -39,9 +39,7 @@ from examples.a2a.server import (
     CONFIRM_ACTION,
     REJECT_ACTION,
     AgentScopeExecutor,
-    _PendingConfirmation,
-    _a2ui_part,
-    _confirmation_result,
+    _a2ui_to_part,
     _create_agent_card,
     _extract_a2ui_actions,
     _human_confirm_component,
@@ -180,7 +178,7 @@ class A2AServerTest(IsolatedAsyncioTestCase):
             REJECT_ACTION,
         )
 
-        part = _a2ui_part(
+        part = _a2ui_to_part(
             [
                 {
                     "version": "v1.0",
@@ -202,24 +200,6 @@ class A2AServerTest(IsolatedAsyncioTestCase):
             "call-1",
         )
 
-    def test_text_confirmation_maps_to_agentscope_result(self) -> None:
-        tool_call = ToolCallBlock(
-            id="call-1",
-            name="send_email",
-            input="{}",
-        )
-        pending = _PendingConfirmation(
-            event=RequireUserConfirmEvent(
-                reply_id="reply-1",
-                tool_calls=[tool_call],
-            ),
-            supports_a2ui=False,
-        )
-
-        result = _confirmation_result(pending, None, "yes")
-
-        self.assertTrue(result.confirmed)
-        self.assertEqual(result.tool_call.id, "call-1")
 
     async def test_confirmation_pauses_and_resumes_a2a_task(self) -> None:
         executor = AgentScopeExecutor(model="test", api_key="unused")
@@ -263,7 +243,7 @@ class A2AServerTest(IsolatedAsyncioTestCase):
             ),
         )
 
-        action_part = _a2ui_part(
+        action_part = _a2ui_to_part(
             [
                 {
                     "version": "v1.0",
