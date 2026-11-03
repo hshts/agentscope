@@ -112,14 +112,10 @@ _processor = A2uiGenerator(
     [CatalogConfig(_BASIC_CATALOG), _AGENT_CATALOG],
 ).create_processor({A2UI_VERSION: {CATALOG_IDS_KEY: SUPPORTED_CATALOG_IDS}})
 
-INSTRUCTION = "\n\n".join([
-    "You are a helpful assistant named Friday.",
-    _processor.prompt_snippet,
-])
 
 
 def _a2ui_to_part(a2ui: Any) -> Part:
-    """Encode one or more A2UI 1.0 messages as an A2A DataPart.
+    """Encode a single A2UI 1.0 message as an A2A DataPart.
 
     ``ParseDict`` accepts a dict or a list at runtime, but its type stub
     only declares ``dict[str, Any]``.
@@ -162,7 +158,7 @@ def _to_a2a_parts(response_parts: Sequence[ResponsePart]) -> list[Part]:
     return parts
 
 
-def _create_parser() -> Parser:
+def _create_a2ui_parser() -> Parser:
     """Create a fresh parser: one parser reads exactly one response.
 
     ``create_parser`` exists in the installed SDK; newer SDKs expose the
@@ -251,7 +247,7 @@ def _renderer_capabilities(
     return None
 
 
-def _renderer_supports_a2ui(
+def _renderer_is_supports_a2ui(
     context_or_message: RequestContext | Message,
 ) -> bool:
     """Use A2UI only when the renderer negotiates the extension or the catalog."""
@@ -304,8 +300,50 @@ def _extract_a2ui_actions(
     return actions
 
 
-def _action_query(actions: list[dict[str, Any]], text_input: str) -> str:
-    """Describe renderer actions as text the agent can answer."""
+def _action_to_query(
+    actions: list[dict[str, Any]],
+    text_input: str,
+    pending_confirmation: RequireUserConfirmEvent | None = None,
+) -> str | UserConfirmResultEvent:
+    """Describe renderer actions as text the agent can answer.
+
+    CONFIRM_ACTION/REJECT_ACTION actions that resolve a pending
+    :class:`RequireUserConfirmEvent` are converted into a
+    :class:`UserConfirmResultEvent` instead of a text turn, so the agent
+    can resume the parked reply with the user's per-tool-call decision.
+    """
+    if pending_confirmation is not None:
+        confirm_ids = {
+            action["context"].get("toolCallId")
+            for action in actions
+            if action["name"] == CONFIRM_ACTION
+        }
+        reject_ids = {
+            action["context"].get("toolCallId")
+            for action in actions
+            if action["name"] == REJECT_ACTION
+        }
+        if confirm_ids or reject_ids:
+            confirm_results = []
+            for tool_call in pending_confirmation.tool_calls:
+                if tool_call.id in confirm_ids:
+                    confirm_results.append(
+                        ConfirmResult(confirmed=True, tool_call=tool_call),
+                    )
+                elif tool_call.id in reject_ids:
+                    confirm_results.append(
+                        ConfirmResult(confirmed=False, tool_call=tool_call),
+                    )
+            if confirm_results:
+                return UserConfirmResultEvent(
+                    reply_id=pending_confirmation.reply_id,
+                    confirm_results=confirm_results,
+                )
+        tool_call_ids = {t.id for t in pending_confirmation.tool_calls}
+        if any(tool_call_ids & (confirm_ids | reject_ids)):
+            logger.warning(
+                "Ignored A2UI confirm/reject actions for pending tool calls.",
+            )
     lines = [
         f'A2UI action "{action["name"]}" with context '
         f"{json.dumps(action['context'], ensure_ascii=False)}"
@@ -418,6 +456,7 @@ class AgentScopeExecutor(AgentExecutor):
         self._mcp_clients: dict[str, MCPClient] = {}
         self._a2ui_surfaces: dict[str, set[str]] = {}
         self._a2ui_contexts: set[str] = set()
+        self._pending_confirms: dict[str, RequireUserConfirmEvent] = {}
 
 
 
@@ -460,10 +499,10 @@ class AgentScopeExecutor(AgentExecutor):
         context_id: str,
         updater: TaskUpdater,
         confirmation: RequireUserConfirmEvent,
-        supports_a2ui: bool,
+        is_supports_a2ui: bool,
     ) -> None:
         """Present the confirmation and park the A2A task at input-required."""
-        if supports_a2ui:
+        if is_supports_a2ui:
             for tool_call in confirmation.tool_calls:
                 await self._emit_component(
                     context_id,
@@ -498,29 +537,19 @@ class AgentScopeExecutor(AgentExecutor):
             )
             if surface_id not in surfaces:
                 continue
-            await _emit_agent_message(
-                updater,
+            await updater.add_artifact(
                 [
-                    _a2ui_to_part([
-                        {
-                            "version": A2UI_VERSION,
-                            "deleteSurface": {"surfaceId": surface_id},
-                        },
-                    ]),
+                    _a2ui_to_part({
+                        "version": A2UI_VERSION,
+                        "deleteSurface": {"surfaceId": surface_id},
+                    }),
                 ],
                 extensions=[A2UI_EXTENSION_URI],
             )
             surfaces.remove(surface_id)
 
 
-
-
-
-    async def _build_agent(
-        self,
-        context_id: str,
-        supports_a2ui: bool,
-    ) -> Agent:
+    async def _build_agent(self,) -> Agent:
         """Build an agent with local tools and an isolated Playwright MCP."""
         workdir = str(Path.cwd().resolve())
         try:
@@ -536,11 +565,7 @@ class AgentScopeExecutor(AgentExecutor):
             agent = Agent(
                 name="Friday",
                 system_prompt="\n\n".join([
-                    (
-                        INSTRUCTION
-                        if supports_a2ui
-                        else "You are a helpful assistant named Friday."
-                    ),
+                      "You are a helpful assistant named Friday.",
                     f"The local working directory is {workdir}.",
                     (
                         "Use Bash, Read, Write, Edit, and Glob for local "
@@ -549,6 +574,7 @@ class AgentScopeExecutor(AgentExecutor):
                         "Do not submit forms or perform consequential actions "
                         "without the user's explicit approval."
                     ),
+                    _processor.prompt_snippet,
                 ]),
                 model=DeepSeekChatModel(
                     credential=DeepSeekCredential(
@@ -559,6 +585,7 @@ class AgentScopeExecutor(AgentExecutor):
                     stream=True,
                 ),
                 toolkit=toolkit,
+      
             )
         except BaseException:
             raise
@@ -578,18 +605,13 @@ class AgentScopeExecutor(AgentExecutor):
         context_id = context.context_id
         task_id = context.task_id
         # A follow-up message (an A2UI action, say) may omit the capabilities,
-        # so once a conversation uses A2UI it keeps using it.
-        supports_a2ui = _renderer_supports_a2ui(context) or (
-            context_id in self._a2ui_contexts
-        )
-        if supports_a2ui:
-            self._a2ui_contexts.add(context_id)
-        parser = _create_parser() if supports_a2ui else None
-        tool_progress: dict[str, dict[str, str]] = {}
+
+
         agent = self._agents.get(context_id)
         if agent is None:
-            agent = await self._build_agent(context_id, supports_a2ui)
+            agent = await self._build_agent()
             self._agents[context_id] = agent
+
         if context.current_task is None:
             await event_queue.enqueue_event(
                 Task(
@@ -600,17 +622,37 @@ class AgentScopeExecutor(AgentExecutor):
             )
         updater = TaskUpdater(event_queue, task_id, context_id)
         await updater.start_work()
-        actions = _extract_a2ui_actions(context)
+        awaiting_confirmation = False
+
+ 
         user_input = context.get_user_input()
+        is_supports_a2ui = _renderer_is_supports_a2ui(context)
+        actions = _extract_a2ui_actions(context)
+        parser = _create_a2ui_parser() if  is_supports_a2ui else None
         if actions:
                 # The renderer clicked a surface the model generated, so the
                 # action is a normal user turn, not a tool decision.
             logger.info(
-                "A2UI action(s) without a pending confirmation: %s",
+                "Received A2UI action(s): %s",
                  [action["name"] for action in actions],
                 )
-            user_input = _action_query(actions, user_input)
-        agent_input = UserMsg(name="user", content=user_input)
+            action_result = _action_to_query(
+                actions,
+                user_input,
+                self._pending_confirms.get(context_id),
+            )
+            if isinstance(action_result, UserConfirmResultEvent):
+                logger.info("Resume pending tool confirmation: %s", [
+                    r.tool_call.id for r in action_result.confirm_results
+                ])
+                self._pending_confirms.pop(context_id, None)
+            user_input = action_result
+
+
+        if isinstance(user_input, UserConfirmResultEvent):
+            agent_input = user_input
+        else:
+            agent_input = UserMsg(name="user", content=user_input)
         streaming = bool(
             parser is not None
             and getattr(parser, "parse_chunk", None)
@@ -618,6 +660,8 @@ class AgentScopeExecutor(AgentExecutor):
         )
         buffered = ""
 
+
+        tool_progress: dict[str, dict[str, Any]] = {}   
         async def emit_part(part: Part) -> None:
             """Send one response part as an agent message."""
             if part.WhichOneof("content") == "text":
@@ -664,7 +708,7 @@ class AgentScopeExecutor(AgentExecutor):
             if isinstance(event, TextBlockDeltaEvent):
                 await emit_text(event.delta)
             elif isinstance(event, ThinkingBlockStartEvent):
-                if supports_a2ui:
+                if is_supports_a2ui:
                     await self._emit_component(
                         context_id,
                         updater,
@@ -672,7 +716,7 @@ class AgentScopeExecutor(AgentExecutor):
                         _thinking_component("Thinking…", "thinking"),
                     )
             elif isinstance(event, ThinkingBlockDeltaEvent):
-                if supports_a2ui:
+                if is_supports_a2ui:
                     # await self._emit_component(
                     #     context_id,
                     #     updater,
@@ -681,7 +725,7 @@ class AgentScopeExecutor(AgentExecutor):
                     #     )
                     await emit_text(event.delta)
             elif isinstance(event, ThinkingBlockEndEvent):
-                if supports_a2ui:
+                if is_supports_a2ui:
                     await self._emit_component(
                         context_id,
                         updater,
@@ -695,13 +739,13 @@ class AgentScopeExecutor(AgentExecutor):
                     "arguments": "",
                     "result": "",
                 }
-                if supports_a2ui:
+                if is_supports_a2ui:
                     await emit_tool(event.tool_call_id)
             elif isinstance(event, ToolCallDeltaEvent):
                 tool_progress[event.tool_call_id]["arguments"] += event.delta
             elif isinstance(event, ToolCallEndEvent):
                 tool_progress[event.tool_call_id]["status"] = "running"
-                if supports_a2ui:
+                if is_supports_a2ui:
                     await emit_tool(event.tool_call_id)
             elif isinstance(event, ToolResultStartEvent):
                 state = tool_progress.setdefault(
@@ -715,7 +759,7 @@ class AgentScopeExecutor(AgentExecutor):
                 )
                 state["name"] = event.tool_call_name
                 state["status"] = "running"
-                if supports_a2ui:
+                if is_supports_a2ui:
                     await emit_tool(event.tool_call_id)
             elif isinstance(event, ToolResultTextDeltaEvent):
                 if event.tool_call_id in tool_progress:
@@ -734,9 +778,11 @@ class AgentScopeExecutor(AgentExecutor):
                     )
                     if state["status"] == "error":
                         state["statusText"] = str(result_state).title()
-                    if supports_a2ui:
+                    if is_supports_a2ui:
                         await emit_tool(event.tool_call_id)
             elif isinstance(event, RequireUserConfirmEvent):
+                awaiting_confirmation = True
+                self._pending_confirms[context_id] = event
                 for tool_call in event.tool_calls:
                     tool_progress[tool_call.id] = {
                         "name": tool_call.name,
@@ -744,27 +790,27 @@ class AgentScopeExecutor(AgentExecutor):
                         "arguments": tool_call.input,
                         "result": "",
                     }
-                    if supports_a2ui:
+                    if is_supports_a2ui:
                         await emit_tool(tool_call.id)
                 await self._emit_confirmation(
                     context_id,
                     updater,
                     event,
-                    supports_a2ui,
+                    is_supports_a2ui,
                 )
             elif isinstance(event, UserConfirmResultEvent):
-                if supports_a2ui:
+                if is_supports_a2ui:
                     await self._emit_delete_surfaces(
                         updater=updater,
                         context_id=context_id, 
                         confirmresultevent=event )
-               
-
-
 
         if parser is not None and not streaming and buffered:
             for part in _to_a2a_parts(_processor.parse_response(buffered)):
                 await emit_part(part)
+
+        if not awaiting_confirmation:
+            await updater.complete()
 
 
     async def cancel(
