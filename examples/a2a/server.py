@@ -34,7 +34,7 @@ from a2a.compat.v0_3.conversions import to_core_part
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
+from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes,create_rest_routes,add_a2a_routes_to_fastapi
 from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
 from a2a.types import (
     AgentCapabilities,  
@@ -48,9 +48,8 @@ from a2a.types import (
     TaskState,
     TaskStatus,
 )
-from starlette.applications import Starlette
-from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
+
+from fastapi import FastAPI
 
 from agentscope.agent import Agent
 from agentscope.model import DeepSeekChatModel,VolcengineChatModel
@@ -454,23 +453,92 @@ class AgentScopeExecutor(AgentExecutor):
         self._card = card
         self._model = model
         self._api_key = api_key
-        self._agents: dict[str, Agent] = {}
         self._mcp_clients: dict[str, MCPClient] = {}
-        self._a2ui_surfaces: dict[str, set[str]] = {}
-        self._a2ui_contexts: set[str] = set()
-        self._pending_confirms: dict[str, RequireUserConfirmEvent] = {}
+
+    SURFACES_KEY = "a2uiSurfaces"
+    PENDING_CONFIRM_KEY = "pendingConfirmation"
+
+    @classmethod
+    def _task_metadata(cls, task: Task) -> dict[str, Any]:
+        """Read the task metadata as a plain dict."""
+        return json_format.MessageToDict(task.metadata)
+
+    @classmethod
+    def _update_task_metadata(
+        cls,
+        task: Task,
+        updates: dict[str, Any],
+    ) -> None:
+        """Merge ``updates`` into the task metadata, keeping other keys."""
+        merged = {**cls._task_metadata(task), **updates}
+        task.metadata.CopyFrom(
+            json_format.ParseDict(merged, struct_pb2.Struct()),
+        )
+
+    @classmethod
+    def _task_surfaces(cls, task: Task) -> set[str]:
+        """Read the set of emitted A2UI surface IDs from the task metadata."""
+        return set(cls._task_metadata(task).get(cls.SURFACES_KEY, []))
+
+    @classmethod
+    def _save_task_surfaces(cls, task: Task, surfaces: set[str]) -> None:
+        """Persist the surface IDs on the task so they survive the request."""
+        cls._update_task_metadata(
+            task,
+            {cls.SURFACES_KEY: sorted(surfaces)},
+        )
+
+    @classmethod
+    def _task_pending_confirm(
+        cls,
+        task: Task,
+    ) -> RequireUserConfirmEvent | None:
+        """Rebuild the parked confirmation from the task metadata."""
+        data = cls._task_metadata(task).get(cls.PENDING_CONFIRM_KEY)
+        if not data:
+            return None
+        return RequireUserConfirmEvent(
+            reply_id=data["reply_id"],
+            tool_calls=[
+                ToolCallBlock(**tool_call) for tool_call in data["tool_calls"]
+            ],
+        )
+
+    @classmethod
+    def _set_task_pending_confirm(
+        cls,
+        task: Task,
+        confirmation: RequireUserConfirmEvent | None,
+    ) -> None:
+        """Persist (or clear) the parked confirmation on the task metadata."""
+        if confirmation is None:
+            cls._update_task_metadata(task, {cls.PENDING_CONFIRM_KEY: None})
+            return
+        cls._update_task_metadata(
+            task,
+            {
+                cls.PENDING_CONFIRM_KEY: {
+                    "reply_id": confirmation.reply_id,
+                    "tool_calls": [
+                        tool_call.model_dump()
+                        for tool_call in confirmation.tool_calls
+                    ],
+                },
+            },
+        )
+
 
 
 
     async def _emit_component(
         self,
-        task_id: str,
+        task: Task,
         updater: TaskUpdater,
         surface_id: str,
         component: dict[str, Any],
     ) -> None:
         """Create or update a custom-catalog component surface."""
-        surfaces = self._a2ui_surfaces.setdefault(task_id, set())
+        surfaces = self._task_surfaces(task)
         envelope = {}
         if surface_id in surfaces:
             envelope = {
@@ -494,14 +562,11 @@ class AgentScopeExecutor(AgentExecutor):
             [_a2ui_to_part(envelope)],
             extensions=[A2UI_EXTENSION_URI],
         )
-        self._a2ui_surfaces[task_id].add(surface_id)
-
-
-
+        self._save_task_surfaces(task, surfaces | {surface_id})
 
     async def _emit_confirmation(
         self,
-        task_id: str,
+        task: Task,
         updater: TaskUpdater,
         confirmation: RequireUserConfirmEvent,
         is_supports_a2ui: bool,
@@ -510,9 +575,9 @@ class AgentScopeExecutor(AgentExecutor):
         if is_supports_a2ui:
             for tool_call in confirmation.tool_calls:
                 await self._emit_component(
-                    task_id,
+                    task,
                     updater,
-                    _stable_surface_id("confirm", task_id, tool_call.id),
+                    _stable_surface_id("confirm", task.id, tool_call.id),
                     _human_confirm_component(tool_call),
                 )
             await updater.requires_input()
@@ -528,16 +593,16 @@ class AgentScopeExecutor(AgentExecutor):
 
     async def _emit_delete_surfaces(
         self,
-        task_id: str,
+        task: Task,
         updater: TaskUpdater,
         confirmresultevent: UserConfirmResultEvent | None,
     ) -> None:
         """Remove confirmation cards after their result is accepted."""
-        surfaces = self._a2ui_surfaces.setdefault(task_id, set())
+        surfaces = self._task_surfaces(task)
         for result in confirmresultevent.confirm_results if confirmresultevent is not None else []:
             surface_id = _stable_surface_id(
                 "confirm",
-                task_id,
+                task.id,
                 result.tool_call.id,
             )
             if surface_id not in surfaces:
@@ -552,6 +617,7 @@ class AgentScopeExecutor(AgentExecutor):
                 extensions=[A2UI_EXTENSION_URI],
             )
             surfaces.remove(surface_id)
+        self._save_task_surfaces(task, surfaces)
 
 
     async def _build_agent(self,) -> Agent:
@@ -612,24 +678,29 @@ class AgentScopeExecutor(AgentExecutor):
         # A follow-up message (an A2UI action, say) may omit the capabilities,
 
 
-        agent = self._agents.get(context_id)
-        if agent is None:
-            agent = await self._build_agent()
-            self._agents[context_id] = agent
+        print(f"Context ID: {context_id}, Task ID: {task_id}")
 
-        if context.current_task is None:
-            await event_queue.enqueue_event(
-                Task(
-                    id=task_id,
-                    context_id=context_id,
-                    status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
-                ),
-            )
-        updater = TaskUpdater(event_queue, task_id, context_id)
-        await updater.start_work()
+        agent = await self._build_agent()
+
         awaiting_confirmation = False
 
- 
+        task = context.current_task
+        if task is None:
+            # The task manager saves this exact object, so metadata
+            # mutations (A2UI surface tracking) survive across requests.
+            task = Task(
+                id=task_id,
+                context_id=context_id,
+                status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
+            )
+            await event_queue.enqueue_event(task)
+
+        # The Task must be enqueued before any status update, otherwise the
+        # handler rejects events with "Agent should enqueue Task before
+        # TaskStatusUpdateEvent".
+        updater = TaskUpdater(event_queue, task_id, context_id)
+        await updater.start_work()
+
         user_input = context.get_user_input()
         is_supports_a2ui = _renderer_is_supports_a2ui(context)
         actions = _extract_a2ui_actions(context)
@@ -644,13 +715,13 @@ class AgentScopeExecutor(AgentExecutor):
             action_result = _action_to_query(
                 actions,
                 user_input,
-                self._pending_confirms.get(context_id),
+                self._task_pending_confirm(task),
             )
             if isinstance(action_result, UserConfirmResultEvent):
                 logger.info("Resume pending tool confirmation: %s", [
                     r.tool_call.id for r in action_result.confirm_results
                 ])
-                self._pending_confirms.pop(context_id, None)
+                self._set_task_pending_confirm(task, None)
             user_input = action_result
 
 
@@ -695,9 +766,9 @@ class AgentScopeExecutor(AgentExecutor):
         async def emit_tool(tool_call_id: str) -> None:
             state = tool_progress[tool_call_id]
             await self._emit_component(
-                task_id,
+                task,
                 updater,
-                _stable_surface_id("tool", task_id, tool_call_id),
+                _stable_surface_id("tool", task.id, tool_call_id),
                 _tool_component(
                     name=state["name"],
                     status=state["status"],
@@ -715,27 +786,27 @@ class AgentScopeExecutor(AgentExecutor):
             elif isinstance(event, ThinkingBlockStartEvent):
                 if is_supports_a2ui:
                     await self._emit_component(
-                        task_id,
+                        task,
                         updater,
-                        _stable_surface_id('thinking', task_id,event.block_id),
+                        _stable_surface_id('thinking', task.id,event.block_id),
                         _thinking_component("Thinking…", "thinking", None, None),
                     )
                 print(f"Thinking block started: {event.block_id}")
             elif isinstance(event, ThinkingBlockDeltaEvent):
                 if is_supports_a2ui:
                     await self._emit_component(
-                        task_id,
+                        task,
                         updater,
-                        _stable_surface_id('thinking', task_id,event.block_id),
+                        _stable_surface_id('thinking', task.id,event.block_id),
                         _thinking_component('thinking', "thinking", event.delta, None),
                         )
 
             elif isinstance(event, ThinkingBlockEndEvent):
                 if is_supports_a2ui:
                     await self._emit_component(
-                        task_id,
+                        task,
                         updater,
-                        _stable_surface_id('thinking', task_id,event.block_id),
+                        _stable_surface_id('thinking', task.id,event.block_id),
                         _thinking_component("Thinking Done", "done", None, None),
                         )           
             elif isinstance(event, ToolCallStartEvent):
@@ -788,7 +859,7 @@ class AgentScopeExecutor(AgentExecutor):
                         await emit_tool(event.tool_call_id)
             elif isinstance(event, RequireUserConfirmEvent):
                 awaiting_confirmation = True
-                self._pending_confirms[context_id] = event
+                self._set_task_pending_confirm(task, event)
                 for tool_call in event.tool_calls:
                     tool_progress[tool_call.id] = {
                         "name": tool_call.name,
@@ -799,7 +870,7 @@ class AgentScopeExecutor(AgentExecutor):
                     if is_supports_a2ui:
                         await emit_tool(tool_call.id)
                 await self._emit_confirmation(
-                    task_id,
+                    task,
                     updater,
                     event,
                     is_supports_a2ui,
@@ -838,13 +909,14 @@ class AgentScopeExecutor(AgentExecutor):
 
 
 
-def create_app(
+
+def create_fastapi_app(
     base_url: str,
     model: str,
     api_key: str,
     cors_origins: list[str] | None = None,
-) -> Starlette:
-    """Build the A2A 1.0 application serving the agent.
+) -> FastAPI:
+    """Build the A2A 1.0 application serving the agent using FastAPI.
 
     Browser renderers send a CORS preflight ``OPTIONS`` before posting a
     JSON-RPC request, so the app answers preflights for the origins it is
@@ -854,7 +926,7 @@ def create_app(
     executor = AgentScopeExecutor(card=card, model=model, api_key=api_key)
 
     @asynccontextmanager
-    async def lifespan(_: Starlette) -> AsyncGenerator[None, None]:
+    async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         try:
             yield
         finally:
@@ -865,27 +937,26 @@ def create_app(
         task_store=InMemoryTaskStore(),
         agent_card=card,
     )
-    return Starlette(
-        routes=[
-            *create_agent_card_routes(card),
-            *create_jsonrpc_routes(
-                handler,
-                rpc_url="/",
-                enable_v0_3_compat=True,
-            ),
-        ],
-        middleware=[
-            Middleware(
-                CORSMiddleware,
-                allow_origins=cors_origins or ["*"],
-                allow_methods=["GET", "POST", "OPTIONS"],
-                allow_headers=["*"],
-                expose_headers=["X-A2A-Extensions"],
-                max_age=600,
-            ),
-        ],
-        lifespan=lifespan,
-    )
+    app = FastAPI()
+    add_a2a_routes_to_fastapi(
+        app,
+        agent_card_routes=create_agent_card_routes(card),
+        # jsonrpc_routes_v0_3=create_jsonrpc_routes(handler, rpc_url='/v0.3',enable_v0_3_compat=True,),
+        # rest_routes_v0_3=create_rest_routes(handler, path_prefix="/rest/v0.3", enable_v0_3_compat=True),
+        jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url='/',),
+        rest_routes=create_rest_routes(handler, path_prefix="/rest/"),
+   )
+    # app.add_middleware(
+    #     CORSMiddleware,
+    #     allow_origins=cors_origins or ["*"],
+    #     allow_methods=["GET", "POST", "OPTIONS"],
+    #     allow_headers=["*"],
+    #     expose_headers=["X-A2A-Extensions"],
+    #     max_age=600,
+    # )
+    return app
+
+    
 
 
 async def main() -> None:
@@ -913,7 +984,7 @@ async def main() -> None:
             "this demo.",
         )
 
-    app = create_app(
+    app = create_fastapi_app(
         base_url=f"http://{args.host}:{args.port}",
         model=args.model,
         api_key=api_key,
