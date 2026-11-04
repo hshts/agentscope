@@ -37,7 +37,7 @@ from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
 from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
 from a2a.types import (
-    AgentCapabilities,
+    AgentCapabilities,  
     AgentCard,
     AgentExtension,
     AgentInterface,
@@ -130,7 +130,7 @@ def _a2ui_to_part(a2ui: Any) -> Part:
     )
 
 
-def _a2ui_payload(part: Part | types_v03.Part | None) -> Any:
+def _part_to_a2ui(part: Part | types_v03.Part | None) -> Any:
     """Return the JSON payload of a 1.0 or legacy 0.3 A2UI DataPart."""
     if part is None:
         return None
@@ -158,7 +158,7 @@ def _to_a2a_parts(response_parts: Sequence[ResponsePart]) -> list[Part]:
     return parts
 
 
-def _create_a2ui_parser() -> Parser:
+def _model_to_a2ui_parser() -> Parser:
     """Create a fresh parser: one parser reads exactly one response.
 
     ``create_parser`` exists in the installed SDK; newer SDKs expose the
@@ -278,7 +278,7 @@ def _extract_a2ui_actions(
 
     actions: list[dict[str, Any]] = []
     for part in message.parts:
-        payload = _a2ui_payload(part)
+        payload = _part_to_a2ui(part)
         if payload is None:
             continue
         items = payload if isinstance(payload, list) else [payload]
@@ -355,9 +355,9 @@ def _action_to_query(
 
 
 
-def _stable_surface_id(kind: str, context_id: str, item_id: str = "") -> str:
+def _stable_surface_id(kind: str, task_id: str, item_id: str = "") -> str:
     """Create a stable, renderer-safe ID without exposing arbitrary tool IDs."""
-    key = f"{kind}:{context_id}:{item_id}"
+    key = f"{kind}:{task_id}:{item_id}"
     return f"agentscope-{kind}-{uuid.uuid5(uuid.NAMESPACE_URL, key).hex}"
 
 
@@ -385,13 +385,15 @@ def _tool_component(
     return component
 
 
-def _thinking_component(text: str, status: str) -> dict[str, Any]:
+def _thinking_component(text: str, status: str, details: str | None,detailsLabel: str | None) -> dict[str, Any]:
     """Build a ThinkingBar component."""
     return {
         "id": "root",
         "component": "ThinkingBar",
         "text": text,
         "status": status,
+        "details": details,
+        "detailsLabel": detailsLabel if detailsLabel else 'Show details',
     }
 
 
@@ -462,13 +464,13 @@ class AgentScopeExecutor(AgentExecutor):
 
     async def _emit_component(
         self,
-        context_id: str,
+        task_id: str,
         updater: TaskUpdater,
         surface_id: str,
         component: dict[str, Any],
     ) -> None:
         """Create or update a custom-catalog component surface."""
-        surfaces = self._a2ui_surfaces.setdefault(context_id, set())
+        surfaces = self._a2ui_surfaces.setdefault(task_id, set())
         envelope = {}
         if surface_id in surfaces:
             envelope = {
@@ -492,11 +494,14 @@ class AgentScopeExecutor(AgentExecutor):
             [_a2ui_to_part(envelope)],
             extensions=[A2UI_EXTENSION_URI],
         )
-        self._a2ui_surfaces[context_id].add(surface_id)
+        self._a2ui_surfaces[task_id].add(surface_id)
+
+
+
 
     async def _emit_confirmation(
         self,
-        context_id: str,
+        task_id: str,
         updater: TaskUpdater,
         confirmation: RequireUserConfirmEvent,
         is_supports_a2ui: bool,
@@ -505,9 +510,9 @@ class AgentScopeExecutor(AgentExecutor):
         if is_supports_a2ui:
             for tool_call in confirmation.tool_calls:
                 await self._emit_component(
-                    context_id,
+                    task_id,
                     updater,
-                    _stable_surface_id("confirm", context_id, tool_call.id),
+                    _stable_surface_id("confirm", task_id, tool_call.id),
                     _human_confirm_component(tool_call),
                 )
             await updater.requires_input()
@@ -523,16 +528,16 @@ class AgentScopeExecutor(AgentExecutor):
 
     async def _emit_delete_surfaces(
         self,
-        context_id: str,
+        task_id: str,
         updater: TaskUpdater,
         confirmresultevent: UserConfirmResultEvent | None,
     ) -> None:
         """Remove confirmation cards after their result is accepted."""
-        surfaces = self._a2ui_surfaces.setdefault(context_id, set())
+        surfaces = self._a2ui_surfaces.setdefault(task_id, set())
         for result in confirmresultevent.confirm_results if confirmresultevent is not None else []:
             surface_id = _stable_surface_id(
                 "confirm",
-                context_id,
+                task_id,
                 result.tool_call.id,
             )
             if surface_id not in surfaces:
@@ -576,10 +581,10 @@ class AgentScopeExecutor(AgentExecutor):
                     ),
                     _processor.prompt_snippet,
                 ]),
-                model=DeepSeekChatModel(
-                    credential=DeepSeekCredential(
+                model=VolcengineChatModel(
+                    credential=VolcengineCredential(
                         api_key=SecretStr(self._api_key),
-                        # base_url= "https://api.deepseek.com",
+                        base_url= "https://ark.cn-beijing.volces.com/api/coding/v3",
                     ),
                     model=self._model,
                     stream=True,
@@ -628,7 +633,7 @@ class AgentScopeExecutor(AgentExecutor):
         user_input = context.get_user_input()
         is_supports_a2ui = _renderer_is_supports_a2ui(context)
         actions = _extract_a2ui_actions(context)
-        parser = _create_a2ui_parser() if  is_supports_a2ui else None
+        parser = _model_to_a2ui_parser() if  is_supports_a2ui else None
         if actions:
                 # The renderer clicked a surface the model generated, so the
                 # action is a normal user turn, not a tool decision.
@@ -690,9 +695,9 @@ class AgentScopeExecutor(AgentExecutor):
         async def emit_tool(tool_call_id: str) -> None:
             state = tool_progress[tool_call_id]
             await self._emit_component(
-                context_id,
+                task_id,
                 updater,
-                _stable_surface_id("tool", context_id, tool_call_id),
+                _stable_surface_id("tool", task_id, tool_call_id),
                 _tool_component(
                     name=state["name"],
                     status=state["status"],
@@ -710,27 +715,28 @@ class AgentScopeExecutor(AgentExecutor):
             elif isinstance(event, ThinkingBlockStartEvent):
                 if is_supports_a2ui:
                     await self._emit_component(
-                        context_id,
+                        task_id,
                         updater,
-                        _stable_surface_id(event.block_id, context_id,event.reply_id),
-                        _thinking_component("Thinking…", "thinking"),
+                        _stable_surface_id('thinking', task_id,event.block_id),
+                        _thinking_component("Thinking…", "thinking", None, None),
                     )
+                print(f"Thinking block started: {event.block_id}")
             elif isinstance(event, ThinkingBlockDeltaEvent):
                 if is_supports_a2ui:
-                    # await self._emit_component(
-                    #     context_id,
-                    #     updater,
-                    #     _stable_surface_id(event.block_id, context_id,event.reply_id),
-                    #     _thinking_component(event.delta, "thinking"),
-                    #     )
-                    await emit_text(event.delta)
+                    await self._emit_component(
+                        task_id,
+                        updater,
+                        _stable_surface_id('thinking', task_id,event.block_id),
+                        _thinking_component('thinking', "thinking", event.delta, None),
+                        )
+
             elif isinstance(event, ThinkingBlockEndEvent):
                 if is_supports_a2ui:
                     await self._emit_component(
-                        context_id,
+                        task_id,
                         updater,
-                        _stable_surface_id(event.block_id, context_id,event.reply_id),
-                        _thinking_component("Thinking Done", "done"),
+                        _stable_surface_id('thinking', task_id,event.block_id),
+                        _thinking_component("Thinking Done", "done", None, None),
                         )           
             elif isinstance(event, ToolCallStartEvent):
                 tool_progress[event.tool_call_id] = {
@@ -793,17 +799,13 @@ class AgentScopeExecutor(AgentExecutor):
                     if is_supports_a2ui:
                         await emit_tool(tool_call.id)
                 await self._emit_confirmation(
-                    context_id,
+                    task_id,
                     updater,
                     event,
                     is_supports_a2ui,
                 )
-            elif isinstance(event, UserConfirmResultEvent):
-                if is_supports_a2ui:
-                    await self._emit_delete_surfaces(
-                        updater=updater,
-                        context_id=context_id, 
-                        confirmresultevent=event )
+
+
 
         if parser is not None and not streaming and buffered:
             for part in _to_a2a_parts(_processor.parse_response(buffered)):
@@ -889,7 +891,7 @@ def create_app(
 async def main() -> None:
     """The main entry point of the server."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="deepseek-flash")
+    parser.add_argument("--model", default="ark-code-latest")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9999)
     parser.add_argument(
@@ -904,7 +906,7 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    api_key = os.environ.get("ARK_API_KEY")
     if not api_key: 
         raise RuntimeError(
             "Set the DEEPSEEK_API_KEY environment variable before running "
