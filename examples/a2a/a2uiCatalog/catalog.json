@@ -5,7 +5,7 @@
   "title": "A2UI Agent Interaction Catalog",
   "description": "Catalog of components that surface what an agent is doing and ask the user to confirm an action: ThinkingBar, ToolCall and HumanConfirm.",
   "catalogId": "https://flutter.dev/catalogs/agent/v1/catalog.json",
-  "instructions": "This catalog shows agent activity and asks the user to confirm an action. Use it in surfaces that mirror the agent's own progress, not for presenting domain content, which the basic catalog's components are better at.\n\n## Components\n\n- `ThinkingBar`: A compact status strip. Use it while the agent is preparing a reply, with `status` `thinking`, and set `details` when the reasoning or progress is worth expanding. Switch `text` to the current step, and `status` to `done` or `error` when the work finishes. Keep `text` to one short sentence, such as `Thinking…` or `Searching the knowledge base…`.\n- `ToolCall`: One tool invocation, identified by `name`, with `status` `pending`, `running`, `success` or `error`. Put the request payload in `arguments` and the response in `result`, as strings (JSON encoded when structured). Both are collapsed by default and shown when the user expands the row, so they can be long.\n- `HumanConfirm`: A card that asks the user to approve or reject an action. `title` is a short question, `message` explains the consequences, and `severity` (`info`, `warning`, `danger`) sets the tone. `confirmAction` and `cancelAction` are standard A2UI actions: dispatch an `event` whose `name` tells you which way the user decided.\n\n## Rules\n\n1. These three components are leaves. They take no children; compose them with `Column`, `Row` or `Card` from the basic catalog.\n2. Mixing catalogs in one surface requires an explicit `catalogId`. When the surface's default `catalogId` is this catalog, every component taken from the basic catalog must name it, and the reverse is also true. If a surface only shows these components, keep this catalog as its default and give the agent one component per row.\n3. Bindings use the v1.0 markers: `{\"@path\": \"/progress/step\"}` reads the data model and `{\"@call\": \"formatString\", \"args\": {...}}` computes a value. Use literal strings for anything the agent already knows.\n4. Set `status` yourself as work advances; it is a literal, not a binding, unless the data model holds the state.\n5. `HumanConfirm` needs a decision event. Do not render it with only a confirm action plus an implicit cancellation, and do not leave `confirmAction` out.\n\n## Example: progress\n\n```json\n[\n  {\n    \"version\": \"v1.0\",\n    \"createSurface\": {\n      \"surfaceId\": \"research\",\n      \"catalogId\": \"https://flutter.dev/catalogs/agent/v1/catalog.json\",\n      \"components\": [\n        {\n          \"id\": \"root\",\n          \"component\": \"Column\",\n          \"children\": [\"thinking\", \"search\"],\n          \"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"\n        },\n        {\n          \"id\": \"thinking\",\n          \"component\": \"ThinkingBar\",\n          \"text\": \"Reading the quarterly report…\",\n          \"status\": \"thinking\",\n          \"details\": \"Comparing revenue across the last four quarters.\"\n        },\n        {\n          \"id\": \"search\",\n          \"component\": \"ToolCall\",\n          \"name\": \"search_documents\",\n          \"title\": \"Searching the knowledge base\",\n          \"status\": \"success\",\n          \"arguments\": \"{\\\"query\\\": \\\"revenue 2025\\\"}\",\n          \"result\": \"3 documents found\"\n        }\n      ]\n    }\n  }\n]\n```\n\n## Example: confirmation\n\n```json\n[\n  {\n    \"version\": \"v1.0\",\n    \"createSurface\": {\n      \"surfaceId\": \"confirm-delete\",\n      \"catalogId\": \"https://flutter.dev/catalogs/agent/v1/catalog.json\",\n      \"components\": [\n        {\n          \"id\": \"root\",\n          \"component\": \"HumanConfirm\",\n          \"title\": \"Delete the draft?\",\n          \"message\": \"The draft and its revisions will be removed. This cannot be undone.\",\n          \"severity\": \"danger\",\n          \"confirmLabel\": \"Delete\",\n          \"cancelLabel\": \"Keep it\",\n          \"confirmAction\": {\n            \"event\": {\n              \"name\": \"delete_confirmed\",\n              \"context\": {\"draftId\": {\"@path\": \"/draft/id\"}}\n            }\n          },\n          \"cancelAction\": {\n            \"event\": {\"name\": \"delete_cancelled\"}\n          }\n        }\n      ],\n      \"dataModel\": {\"draft\": {\"id\": \"d-42\"}}\n    }\n  }\n]\n```",
+  "instructions": "This catalog shows agent activity and asks the user to confirm an action. Use it in surfaces that mirror the agent's own progress, not for presenting domain content, which the basic catalog's components are better at.\n\n## Components\n\n- `ThinkingBar`: A compact status strip. Use it while the agent is preparing a reply, with `status` `thinking`, and set `details` when the reasoning or progress is worth expanding. Switch `text` to the current step, and `status` to `done` or `error` when the work finishes. Keep `text` to one short sentence, such as `Thinking…` or `Searching the knowledge base…`. To stream long reasoning, send each chunk in `append`; the renderer concatenates locally, and a later message without `append` replaces the accumulated buffer, so send a full `details` resnapshot to recover after a reconnect.\n- `ToolCall`: One tool invocation, identified by `name`, with `status` `pending`, `running`, `success` or `error`. Put the request payload in `arguments` and the response in `result`, as strings (JSON encoded when structured). Both are collapsed by default and shown when the user expands the row, so they can be long.\n- `HumanConfirm`: A card that asks the user to approve or reject an action. `title` is a short question, `message` explains the consequences, and `severity` (`info`, `warning`, `danger`) sets the tone. `confirmAction` and `cancelAction` are standard A2UI actions: dispatch an `event` whose `name` tells you which way the user decided.\n\n## Rules\n\n1. These three components are leaves. They take no children; compose them with `Column`, `Row` or `Card` from the basic catalog.\n2. A component resolves its catalog from its own `catalogId`, then from the surface's default `catalogId`; there is no fallback. When a surface mixes this catalog with the basic catalog, give every component whose catalog is not the surface's default an explicit `catalogId`.\n3. Bindings use the v1.0 markers: `{\"@path\": \"/progress/step\"}` reads the data model and `{\"@call\": \"formatString\", \"args\": {...}}` computes a value. Use literal strings for anything the agent already knows.\n4. Set `status` yourself as work advances; it is a literal, not a binding, unless the data model holds the state.\n5. `HumanConfirm` needs a decision event. Do not render it with only a confirm action plus an implicit cancellation, and do not leave `confirmAction` out.\n\n## Example: progress\n\n```json\n[\n  {\n    \"version\": \"v1.0\",\n    \"createSurface\": {\n      \"surfaceId\": \"research\",\n      \"catalogId\": \"https://flutter.dev/catalogs/agent/v1/catalog.json\",\n      \"components\": [\n        {\n          \"id\": \"root\",\n          \"component\": \"Column\",\n          \"children\": [\"thinking\", \"search\"],\n          \"catalogId\": \"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json\"\n        },\n        {\n          \"id\": \"thinking\",\n          \"component\": \"ThinkingBar\",\n          \"text\": \"Reading the quarterly report…\",\n          \"status\": \"thinking\",\n          \"details\": \"Comparing revenue across the last four quarters.\"\n        },\n        {\n          \"id\": \"search\",\n          \"component\": \"ToolCall\",\n          \"name\": \"search_documents\",\n          \"title\": \"Searching the knowledge base\",\n          \"status\": \"success\",\n          \"arguments\": \"{\\\"query\\\": \\\"revenue 2025\\\"}\",\n          \"result\": \"3 documents found\"\n        }\n      ]\n    }\n  }\n]\n```\n\n## Example: confirmation\n\n```json\n[\n  {\n    \"version\": \"v1.0\",\n    \"createSurface\": {\n      \"surfaceId\": \"confirm-delete\",\n      \"catalogId\": \"https://flutter.dev/catalogs/agent/v1/catalog.json\",\n      \"components\": [\n        {\n          \"id\": \"root\",\n          \"component\": \"HumanConfirm\",\n          \"title\": \"Delete the draft?\",\n          \"message\": \"The draft and its revisions will be removed. This cannot be undone.\",\n          \"severity\": \"danger\",\n          \"confirmLabel\": \"Delete\",\n          \"cancelLabel\": \"Keep it\",\n          \"confirmAction\": {\n            \"event\": {\n              \"name\": \"delete_confirmed\",\n              \"context\": {\"draftId\": {\"@path\": \"/draft/id\"}}\n            }\n          },\n          \"cancelAction\": {\n            \"event\": {\"name\": \"delete_cancelled\"}\n          }\n        }\n      ],\n      \"dataModel\": {\"draft\": {\"id\": \"d-42\"}}\n    }\n  }\n]\n```",
   "components": {
     "ThinkingBar": {
       "type": "object",
@@ -21,12 +21,20 @@
         "status": {
           "type": "string",
           "description": "The state of the work the bar reports. 'thinking' animates a progress indicator, 'done' shows a check, and 'error' shows a failure icon.",
-          "enum": ["thinking", "done", "error"],
+          "enum": [
+            "thinking",
+            "done",
+            "error"
+          ],
           "default": "thinking"
         },
         "details": {
           "$ref": "common_types.json#/$defs/DynamicString",
           "description": "The reasoning or progress details, revealed when the user expands the bar. Markdown is not interpreted; keep to plain sentences or short lines. Omit it when there is nothing to expand."
+        },
+        "append": {
+          "$ref": "common_types.json#/$defs/DynamicString",
+          "description": "A text chunk that the renderer concatenates locally onto the details accumulated so far, letting the agent stream reasoning deltas without resending the full text. An explicit 'details' snapshot replaces the accumulated buffer, so a full resnapshot restores state after a reconnect; chunks stop accumulating once the bar reaches 'done' or 'error', keeping the reasoning expandable."
         },
         "detailsLabel": {
           "$ref": "common_types.json#/$defs/DynamicString",
@@ -37,7 +45,10 @@
           "description": "The relative weight of this component within a Row or Column. This is similar to the CSS 'flex-grow' property. Note: this may ONLY be set when the component is a direct descendant of a Row or Column."
         }
       },
-      "required": ["component", "text"]
+      "required": [
+        "component",
+        "text"
+      ]
     },
     "ToolCall": {
       "type": "object",
@@ -57,7 +68,12 @@
         "status": {
           "type": "string",
           "description": "The state of the invocation. 'pending' is queued, 'running' animates a progress indicator, 'success' shows a check and 'error' shows a failure icon.",
-          "enum": ["pending", "running", "success", "error"],
+          "enum": [
+            "pending",
+            "running",
+            "success",
+            "error"
+          ],
           "default": "running"
         },
         "statusText": {
@@ -103,7 +119,10 @@
           "description": "The relative weight of this component within a Row or Column. This is similar to the CSS 'flex-grow' property. Note: this may ONLY be set when the component is a direct descendant of a Row or Column."
         }
       },
-      "required": ["component", "name"]
+      "required": [
+        "component",
+        "name"
+      ]
     },
     "HumanConfirm": {
       "type": "object",
@@ -123,7 +142,11 @@
         "severity": {
           "type": "string",
           "description": "The tone of the card. 'info' asks an ordinary question, 'warning' flags a consequence, and 'danger' flags an irreversible or destructive action.",
-          "enum": ["info", "warning", "danger"],
+          "enum": [
+            "info",
+            "warning",
+            "danger"
+          ],
           "default": "info"
         },
         "confirmLabel": {
@@ -147,7 +170,11 @@
           "description": "The relative weight of this component within a Row or Column. This is similar to the CSS 'flex-grow' property. Note: this may ONLY be set when the component is a direct descendant of a Row or Column."
         }
       },
-      "required": ["component", "title", "confirmAction"]
+      "required": [
+        "component",
+        "title",
+        "confirmAction"
+      ]
     }
   },
   "$defs": {

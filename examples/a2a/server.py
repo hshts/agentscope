@@ -50,6 +50,8 @@ from a2a.types import (
 )
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
 
 from agentscope.agent import Agent
 from agentscope.model import DeepSeekChatModel,VolcengineChatModel
@@ -80,11 +82,12 @@ from a2ui.constants import A2UI_ACTIONS_KEY, A2UI_CLIENT_CAPABILITIES_KEY
 from a2ui.core.basic_catalog import BasicCatalog
 from a2ui.core.schema import ProtocolVersion
 from a2ui.inference_formats import to_message_dicts
+from a2ui.core import A2uiError
 from a2ui.parser import A2uiPart, Parser, ResponsePart, TextPart
-from a2ui.processor import A2uiGenerator, CatalogConfig
+from a2ui.processor import A2uiGenerator, CatalogConfig, A2uiRequestProcessor
 
 
-A2UI_VERSION = "v1.0"
+A2UI_VERSION = "1.0"
 A2UI_MIME_TYPE = "application/a2ui+json"
 # v0.8 and v0.9 renderers tag their parts with this deprecated type.
 A2UI_DEPRECATED_MIME_TYPE = "application/json+a2ui"
@@ -98,7 +101,6 @@ RENDERER_CAPABILITIES_KEYS = (
 CONFIRM_ACTION = "agentscope.tool.confirm"
 REJECT_ACTION = "agentscope.tool.reject"
 
-logger = logging.getLogger(__name__)
 
 _BASIC_CATALOG = BasicCatalog(ProtocolVersion.V1_0)
 _AGENT_CATALOG = CatalogConfig.from_path(
@@ -111,7 +113,11 @@ _processor = A2uiGenerator(
     [CatalogConfig(_BASIC_CATALOG), _AGENT_CATALOG],
 ).create_processor({A2UI_VERSION: {CATALOG_IDS_KEY: SUPPORTED_CATALOG_IDS}})
 
+# The processor exposes a stateless cached ``parser`` property. A parser
+# holds no state, so reusing it across responses is safe.
+parser = cast(Parser, _processor.parser)
 
+logger = logging.getLogger(__name__)
 
 def _a2ui_to_part(a2ui: Any) -> Part:
     """Encode a single A2UI 1.0 message as an A2A DataPart.
@@ -156,17 +162,6 @@ def _to_a2a_parts(response_parts: Sequence[ResponsePart]) -> list[Part]:
                 parts.append(_a2ui_to_part(message))
     return parts
 
-
-def _model_to_a2ui_parser() -> Parser:
-    """Create a fresh parser: one parser reads exactly one response.
-
-    ``create_parser`` exists in the installed SDK; newer SDKs expose the
-    parser as a ``parser`` property instead, so both are accepted.
-    """
-    factory = getattr(_processor, "create_parser", None)
-    if callable(factory):
-        return cast(Parser, factory())
-    return cast(Parser, getattr(_processor, "parser"))
 
 
 def _a2ui_extension() -> AgentExtension:
@@ -384,16 +379,26 @@ def _tool_component(
     return component
 
 
-def _thinking_component(text: str, status: str, details: str | None,detailsLabel: str | None) -> dict[str, Any]:
+def _thinking_component(
+    text: str,
+    status: str,
+    append: str | None = None,
+    details: str | None = None,
+) -> dict[str, Any]:
     """Build a ThinkingBar component."""
-    return {
+    component: dict[str, Any] = {
         "id": "root",
         "component": "ThinkingBar",
         "text": text,
         "status": status,
-        "details": details,
-        "detailsLabel": detailsLabel if detailsLabel else 'Show details',
     }
+    # Only carry `append`/`details` when set: null values would fail the
+    # properties' string schemas and make the renderer drop the component.
+    if append:
+        component["append"] = append
+    if details:
+        component["details"] = details
+    return component
 
 
 def _human_confirm_component(tool_call: ToolCallBlock) -> dict[str, Any]:
@@ -454,6 +459,8 @@ class AgentScopeExecutor(AgentExecutor):
         self._model = model
         self._api_key = api_key
         self._mcp_clients: dict[str, MCPClient] = {}
+        self._agents: dict[str, Agent] = {}
+
 
     SURFACES_KEY = "a2uiSurfaces"
     PENDING_CONFIRM_KEY = "pendingConfirmation"
@@ -520,7 +527,7 @@ class AgentScopeExecutor(AgentExecutor):
                 cls.PENDING_CONFIRM_KEY: {
                     "reply_id": confirmation.reply_id,
                     "tool_calls": [
-                        tool_call.model_dump()
+                        tool_call.model_dump(mode="json")
                         for tool_call in confirmation.tool_calls
                     ],
                 },
@@ -675,12 +682,16 @@ class AgentScopeExecutor(AgentExecutor):
 
         context_id = context.context_id
         task_id = context.task_id
-        # A follow-up message (an A2UI action, say) may omit the capabilities,
+        # The agent is what remembers the parked reply awaiting confirmation,
+        # so it must be reused across requests of the same context.
+        agent = self._agents.get(context_id)
+        if agent is None:
+            agent = await self._build_agent()
+            self._agents[context_id] = agent
+            logger.info("Context %s: built new agent", context_id)
+        else:
+            logger.info("Context %s: reusing parked agent", context_id)
 
-
-        print(f"Context ID: {context_id}, Task ID: {task_id}")
-
-        agent = await self._build_agent()
 
         awaiting_confirmation = False
 
@@ -704,7 +715,6 @@ class AgentScopeExecutor(AgentExecutor):
         user_input = context.get_user_input()
         is_supports_a2ui = _renderer_is_supports_a2ui(context)
         actions = _extract_a2ui_actions(context)
-        parser = _model_to_a2ui_parser() if  is_supports_a2ui else None
         if actions:
                 # The renderer clicked a surface the model generated, so the
                 # action is a normal user turn, not a tool decision.
@@ -729,15 +739,16 @@ class AgentScopeExecutor(AgentExecutor):
             agent_input = user_input
         else:
             agent_input = UserMsg(name="user", content=user_input)
-        streaming = bool(
-            parser is not None
-            and getattr(parser, "parse_chunk", None)
-            and getattr(parser, "supports_streaming", False)
-        )
+        streaming = bool(parser is not None and parser.supports_streaming)
+  
+
         buffered = ""
-
-
-        tool_progress: dict[str, dict[str, Any]] = {}   
+        a2ui_stream = parser.open_stream() if parser is not None else None
+  
+        tool_progress: dict[str, dict[str, Any]] = {}
+        # Reasoning accumulated server-side, keyed by thinking block id, so
+        # the terminal update can carry a full `details` snapshot.
+        thinking_text: dict[str, str] = {}   
         async def emit_part(part: Part) -> None:
             """Send one response part as an agent message."""
             if part.WhichOneof("content") == "text":
@@ -754,14 +765,19 @@ class AgentScopeExecutor(AgentExecutor):
         async def emit_text(text: str) -> None:
             """Stream model text, splitting out the A2UI blocks it carries."""
             nonlocal buffered
-            if parser is None:
-                await emit_part(Part(text=text))
-                return
+            await emit_part(Part(text=text))
             if not streaming:
                 buffered += text
                 return
-            for part in _to_a2a_parts(parser.parse_chunk(text)):
-                await emit_part(part)
+            elif a2ui_stream is not None:
+                try:
+                    a2ui_stream.feed(text)
+                    # for part in a2ui_stream.ready_parts:
+                    #     await emit_part(_a2ui_to_part(part))
+                except A2uiError as e:
+                    logger.warning("A2UI parse failed, sending raw text: %s", e)
+                    buffered += text
+
 
         async def emit_tool(tool_call_id: str) -> None:
             state = tool_progress[tool_call_id]
@@ -789,26 +805,40 @@ class AgentScopeExecutor(AgentExecutor):
                         task,
                         updater,
                         _stable_surface_id('thinking', task.id,event.block_id),
-                        _thinking_component("Thinking…", "thinking", None, None),
+                        _thinking_component("Thinking…", "thinking"),
                     )
                 print(f"Thinking block started: {event.block_id}")
+
             elif isinstance(event, ThinkingBlockDeltaEvent):
                 if is_supports_a2ui:
+                    thinking_text[event.block_id] = (
+                        thinking_text.get(event.block_id, "") + event.delta
+                    )
+                    # Delta only: the client accumulates locally, so the
+                    # payload stays O(chunk) regardless of reasoning length.
                     await self._emit_component(
                         task,
                         updater,
                         _stable_surface_id('thinking', task.id,event.block_id),
-                        _thinking_component('thinking', "thinking", event.delta, None),
-                        )
+                        _thinking_component("Thinking…", "thinking", event.delta),
+                    )
+                    # await emit_text(event.delta)
 
             elif isinstance(event, ThinkingBlockEndEvent):
                 if is_supports_a2ui:
+                    # Terminal full snapshot: an explicit `details` restores
+                    # the reasoning for clients that joined or replayed past
+                    # any of the deltas above.
                     await self._emit_component(
                         task,
                         updater,
                         _stable_surface_id('thinking', task.id,event.block_id),
-                        _thinking_component("Thinking Done", "done", None, None),
-                        )           
+                        _thinking_component(
+                            "Thinking Done",
+                            "done",
+                            details=thinking_text.pop(event.block_id, None),
+                        ),
+                    )
             elif isinstance(event, ToolCallStartEvent):
                 tool_progress[event.tool_call_id] = {
                     "name": event.tool_call_name,
@@ -878,12 +908,30 @@ class AgentScopeExecutor(AgentExecutor):
 
 
 
+        if a2ui_stream is not None and not awaiting_confirmation:
+            # The stream holds back text that might start a tag; close it to
+            # get the final parts of the reply.
+            try:
+                for part in a2ui_stream.close():
+                    await emit_part(_a2ui_to_part(part))
+            except A2uiError as e:
+                logger.warning("A2UI stream close failed: %s", e)
+
         if parser is not None and not streaming and buffered:
-            for part in _to_a2a_parts(_processor.parse_response(buffered)):
+            try:
+                parts = _to_a2a_parts(_processor.parse_response(buffered))
+            except A2uiError as e:
+                # Fall back to plain text when the model emits invalid DSL
+                # instead of failing the whole task.
+                logger.warning("A2UI parse failed, sending raw text: %s", e)
+                parts = [Part(text=buffered)]
+            for part in parts:
                 await emit_part(part)
+
 
         if not awaiting_confirmation:
             await updater.complete()
+
 
 
     async def cancel(
@@ -943,17 +991,17 @@ def create_fastapi_app(
         agent_card_routes=create_agent_card_routes(card),
         # jsonrpc_routes_v0_3=create_jsonrpc_routes(handler, rpc_url='/v0.3',enable_v0_3_compat=True,),
         # rest_routes_v0_3=create_rest_routes(handler, path_prefix="/rest/v0.3", enable_v0_3_compat=True),
-        jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url='/',),
-        rest_routes=create_rest_routes(handler, path_prefix="/rest/"),
+        jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url='/',enable_v0_3_compat=True),
+        rest_routes=create_rest_routes(handler, path_prefix="/rest",enable_v0_3_compat=True),
    )
-    # app.add_middleware(
-    #     CORSMiddleware,
-    #     allow_origins=cors_origins or ["*"],
-    #     allow_methods=["GET", "POST", "OPTIONS"],
-    #     allow_headers=["*"],
-    #     expose_headers=["X-A2A-Extensions"],
-    #     max_age=600,
-    # )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins or ["*"],
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["X-A2A-Extensions"],
+        max_age=600,
+    )
     return app
 
     
@@ -984,14 +1032,16 @@ async def main() -> None:
             "this demo.",
         )
 
-    app = create_fastapi_app(
+    fast_app = create_fastapi_app(
         base_url=f"http://{args.host}:{args.port}",
         model=args.model,
         api_key=api_key,
         cors_origins=args.cors_origins,
     )
+
+
     await uvicorn.Server(
-        uvicorn.Config(app, host=args.host, port=args.port),
+        uvicorn.Config(fast_app, host=args.host, port=args.port),
     ).serve()
 
 
