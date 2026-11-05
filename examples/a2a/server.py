@@ -83,7 +83,14 @@ from a2ui.core.basic_catalog import BasicCatalog
 from a2ui.core.schema import ProtocolVersion
 from a2ui.inference_formats import to_message_dicts
 from a2ui.core import A2uiError
-from a2ui.parser import A2uiPart, Parser, ResponsePart, TextPart
+from a2ui.parser import (
+    A2uiPart,
+    ErrorPart,
+    Parser,
+    ResponsePart,
+    StreamPart,
+    TextPart,
+)
 from a2ui.processor import A2uiGenerator, CatalogConfig, A2uiRequestProcessor
 
 
@@ -161,6 +168,22 @@ def _to_a2a_parts(response_parts: Sequence[ResponsePart]) -> list[Part]:
             for message in to_message_dicts(response_part.a2ui):
                 parts.append(_a2ui_to_part(message))
     return parts
+
+
+def _stream_part_to_a2a_parts(stream_part: StreamPart) -> list[Part]:
+    """Convert one response-stream part into A2A parts.
+
+    Stream TextParts are skipped: ``emit_text`` already forwards the raw model
+    text, so only the compiled A2UI blocks need to be sent towards the end.
+    """
+    if isinstance(stream_part, A2uiPart):
+        return [
+            _a2ui_to_part(message)
+            for message in to_message_dicts(stream_part.a2ui)
+        ]
+    if isinstance(stream_part, ErrorPart):
+        logger.warning("A2UI stream rejected a block: %s", stream_part.error)
+    return []
 
 
 
@@ -743,7 +766,14 @@ class AgentScopeExecutor(AgentExecutor):
   
 
         buffered = ""
-        a2ui_stream = parser.open_stream() if parser is not None else None
+        a2ui_stream = (
+            # "continue" keeps the stream alive after a rejected block: a bad
+            # DSL block yields an ErrorPart instead of closing the stream and
+            # crashing the task on the next text delta.
+            parser.open_stream(after_rejected_block="continue")
+            if parser is not None
+            else None
+        )
   
         tool_progress: dict[str, dict[str, Any]] = {}
         # Reasoning accumulated server-side, keyed by thinking block id, so
@@ -762,21 +792,32 @@ class AgentScopeExecutor(AgentExecutor):
                 extensions=[A2UI_EXTENSION_URI],
             )
 
-        async def emit_text(text: str) -> None:
+        async def handle_a2ui(text: str) -> None:
             """Stream model text, splitting out the A2UI blocks it carries."""
             nonlocal buffered
-            await emit_part(Part(text=text))
             if not streaming:
                 buffered += text
                 return
             elif a2ui_stream is not None:
                 try:
-                    a2ui_stream.feed(text)
-                    # for part in a2ui_stream.ready_parts:
-                    #     await emit_part(_a2ui_to_part(part))
+                    for part in a2ui_stream.feed(text):
+                        if isinstance(part,A2uiPart):
+                            for message in to_message_dicts(part.a2ui):
+                                await emit_part(_a2ui_to_part(message))
+                                print(f"Emitting A2UI message: {message}")
+                                print(f"Emitting A2UI message as dict: {_a2ui_to_part(message)}")
+                            # print(f"Emitting A2UI part: {message}")
+                            # print(f"Emitting A2UI part as dict: {to_message_dicts(part.a2ui)}")
+                            # print(f"Emitting A2UI part as A2A Part: {_a2ui_to_part(to_message_dicts(part.a2ui))}")
+                            # await emit_part(_a2ui_to_part(to_message_dicts(part.a2ui)))
+
                 except A2uiError as e:
                     logger.warning("A2UI parse failed, sending raw text: %s", e)
                     buffered += text
+                except ValueError as e:
+                    # The stream is closed (an earlier block was rejected and
+                    # after_rejected_block did not apply); keep the raw text.
+                    logger.warning("A2UI stream no longer accepts text: %s", e)
 
 
         async def emit_tool(tool_call_id: str) -> None:
@@ -794,11 +835,11 @@ class AgentScopeExecutor(AgentExecutor):
                 ),
             )
 
-
   
         async for event in agent.reply_stream(agent_input):
             if isinstance(event, TextBlockDeltaEvent):
-                await emit_text(event.delta)
+                await emit_part(Part(text=event.delta))
+                await handle_a2ui(event.delta)
             elif isinstance(event, ThinkingBlockStartEvent):
                 if is_supports_a2ui:
                     await self._emit_component(
@@ -816,13 +857,14 @@ class AgentScopeExecutor(AgentExecutor):
                     )
                     # Delta only: the client accumulates locally, so the
                     # payload stays O(chunk) regardless of reasoning length.
+                    await handle_a2ui(event.delta)
                     await self._emit_component(
                         task,
                         updater,
                         _stable_surface_id('thinking', task.id,event.block_id),
                         _thinking_component("Thinking…", "thinking", event.delta),
                     )
-                    # await emit_text(event.delta)
+
 
             elif isinstance(event, ThinkingBlockEndEvent):
                 if is_supports_a2ui:
@@ -908,26 +950,26 @@ class AgentScopeExecutor(AgentExecutor):
 
 
 
-        if a2ui_stream is not None and not awaiting_confirmation:
-            # The stream holds back text that might start a tag; close it to
-            # get the final parts of the reply.
-            try:
-                for part in a2ui_stream.close():
-                    await emit_part(_a2ui_to_part(part))
-            except A2uiError as e:
-                logger.warning("A2UI stream close failed: %s", e)
+        # if a2ui_stream is not None and not awaiting_confirmation:
+        #     # The stream holds back text that might start a tag; close it to
+        #     # get the final parts of the reply.
+        #     try:
+        #         for stream_part in a2ui_stream.close():
+        #             for part in _stream_part_to_a2a_parts(stream_part):
+        #                 await emit_part(part)
+        #     except A2uiError as e:
+        #         logger.warning("A2UI stream close failed: %s", e)
 
-        if parser is not None and not streaming and buffered:
-            try:
-                parts = _to_a2a_parts(_processor.parse_response(buffered))
-            except A2uiError as e:
-                # Fall back to plain text when the model emits invalid DSL
-                # instead of failing the whole task.
-                logger.warning("A2UI parse failed, sending raw text: %s", e)
-                parts = [Part(text=buffered)]
-            for part in parts:
-                await emit_part(part)
-
+        # if parser is not None and not streaming and buffered:
+        #     try:
+        #         parts = _to_a2a_parts(_processor.parse_response(buffered))
+        #     except A2uiError as e:
+        #         # Fall back to plain text when the model emits invalid DSL
+        #         # instead of failing the whole task.
+        #         logger.warning("A2UI parse failed, sending raw text: %s", e)
+        #         parts = [Part(text=buffered)]
+        #     for part in parts:
+        #         await emit_part(part)
 
         if not awaiting_confirmation:
             await updater.complete()
