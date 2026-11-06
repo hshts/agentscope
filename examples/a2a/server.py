@@ -95,7 +95,7 @@ from a2ui.parser import (
     TextPart,
 )
 from a2ui.processor import A2uiGenerator, CatalogConfig
-from a2ui.a2a import create_a2ui_part,to_a2a_parts,parse_content_to_parts,stream_response_to_parts
+from a2ui.a2a import create_a2ui_part,to_a2a_parts,parse_content_to_parts
 
 
 
@@ -131,20 +131,20 @@ parser = cast(Parser, _processor.parser)
 
 logger = logging.getLogger(__name__)
 
-def _a2ui_to_part(a2ui: dict[str, Any] | list[Any]) -> Part:
-    """Encode an A2UI 1.0 message (or message list) as an A2A DataPart.
+# def _a2ui_to_part(a2ui: dict[str, Any] | list[Any]) -> Part:
+#     """Encode an A2UI 1.0 message (or message list) as an A2A DataPart.
 
-    ``ParseDict`` accepts a dict or a list at runtime, but its type stub
-    only declares ``dict[str, Any]``.
-    """
-    return Part(
-        data=json_format.ParseDict(
-            cast(Any, a2ui),
-            struct_pb2.Value(),
-        ),
-        metadata={"mimeType": A2UI_MIME_TYPE},
-        media_type=A2UI_MIME_TYPE,
-    )
+#     ``ParseDict`` accepts a dict or a list at runtime, but its type stub
+#     only declares ``dict[str, Any]``.
+#     """
+#     return Part(
+#         data=json_format.ParseDict(
+#             cast(Any, a2ui),
+#             struct_pb2.Value(),
+#         ),
+#         metadata={"mimeType": A2UI_MIME_TYPE},
+#         media_type=A2UI_MIME_TYPE,
+#     )
 
 
 def _part_to_a2ui(part: Part | types_v03.Part | None) -> Any:
@@ -162,16 +162,16 @@ def _part_to_a2ui(part: Part | types_v03.Part | None) -> Any:
     return json_format.MessageToDict(part.data)
 
 
-def _to_a2a_parts(parts: Sequence[ResponsePart]) -> list[Part]:
-    """Convert a sequence of A2UI response parts into A2A message parts."""
-    a2a_parts: list[Part] = []
-    for a2ui_part in parts:
-        if isinstance(a2ui_part, TextPart):
-            a2a_parts.append(Part(text=a2ui_part.text))
-        elif isinstance(a2ui_part, A2uiPart):
-            for message in to_message_dicts(a2ui_part.a2ui):
-                a2a_parts.append(_a2ui_to_part(message))
-    return a2a_parts
+# def _to_a2a_parts(parts: Sequence[ResponsePart]) -> list[Part]:
+#     """Convert a sequence of A2UI response parts into A2A message parts."""
+#     a2a_parts: list[Part] = []
+#     for a2ui_part in parts:
+#         if isinstance(a2ui_part, TextPart):
+#             a2a_parts.append(Part(text=a2ui_part.text))
+#         elif isinstance(a2ui_part, A2uiPart):
+#             for message in to_message_dicts(a2ui_part.a2ui):
+#                 a2a_parts.append(_a2ui_to_part(message))
+#     return a2a_parts
 
 
 
@@ -220,6 +220,56 @@ def _create_agent_card(base_url: str) -> AgentCard:
             ),
         ],
     )
+
+async def _build_agent(
+        api_key :str,
+        model :str
+        ) -> Agent:
+    """Build an agent with local tools and an isolated Playwright MCP."""
+    workdir = str(Path.cwd().resolve())
+    try:
+        toolkit = Toolkit(
+            tools=[
+                Bash(cwd=workdir),
+                Read(),
+                Write(),
+                Edit(),
+                Glob(),
+            ],
+        )
+        agent = Agent(
+            name="Friday",
+            system_prompt="\n\n".join([
+                  "You are a helpful assistant named Friday.",
+                f"The local working directory is {workdir}.",
+                (
+                    "Use Bash, Read, Write, Edit, and Glob for local "
+                    "development tasks. Use Playwright only for websites "
+                    "and applications the user is authorized to test. "
+                    "Do not submit forms or perform consequential actions "
+                    "without the user's explicit approval."
+                ),
+                _processor.prompt_snippet,
+            ]),
+            model=VolcengineChatModel(
+                credential=VolcengineCredential(
+                    api_key=SecretStr(api_key),
+                    base_url= "https://ark.cn-beijing.volces.com/api/coding/v3",
+                ),
+                model=model,
+                stream=True,
+                parameters= VolcengineChatModel.Parameters(thinking_enable=True),
+            ),
+ 
+ 
+            toolkit=toolkit,
+  
+        )
+    except BaseException:
+        raise
+ 
+    return agent
+
 
 
 def _a2a_message(
@@ -466,7 +516,7 @@ async def emit_component(
                 "components": [component],
             },
         }
-    await emit_agent_message(updater,[_a2ui_to_part(envelope)],)
+    await emit_agent_message(updater,[create_a2ui_part(envelope,A2UI_VERSION)],)
     _save_task_surfaces(task, surfaces | {surface_id})
 
 
@@ -526,7 +576,7 @@ async def emit_delete_surfaces(
         await emit_agent_message(
             updater,
             [
-                _a2ui_to_part({
+                create_a2ui_part({
                     "version": A2UI_VERSION,
                     "deleteSurface": {"surfaceId": surface_id},
                 }),
@@ -634,53 +684,6 @@ class AgentScopeExecutor(AgentExecutor):
         )
 
 
-    async def _build_agent(self,) -> Agent:
-        """Build an agent with local tools and an isolated Playwright MCP."""
-        workdir = str(Path.cwd().resolve())
-        try:
-            toolkit = Toolkit(
-                tools=[
-                    Bash(cwd=workdir),
-                    Read(),
-                    Write(),
-                    Edit(),
-                    Glob(),
-                ],
-            )
-            agent = Agent(
-                name="Friday",
-                system_prompt="\n\n".join([
-                      "You are a helpful assistant named Friday.",
-                    f"The local working directory is {workdir}.",
-                    (
-                        "Use Bash, Read, Write, Edit, and Glob for local "
-                        "development tasks. Use Playwright only for websites "
-                        "and applications the user is authorized to test. "
-                        "Do not submit forms or perform consequential actions "
-                        "without the user's explicit approval."
-                    ),
-                    _processor.prompt_snippet,
-                ]),
-                model=VolcengineChatModel(
-                    credential=VolcengineCredential(
-                        api_key=SecretStr(self._api_key),
-                        base_url= "https://ark.cn-beijing.volces.com/api/coding/v3",
-                    ),
-                    model=self._model,
-                    stream=True,
-                    parameters= VolcengineChatModel.Parameters(thinking_enable=True),
-                ),
-
-
-                toolkit=toolkit,
-      
-            )
-        except BaseException:
-            raise
-
-        return agent
-
-
     async def execute(
         self,
         context: RequestContext,
@@ -696,7 +699,7 @@ class AgentScopeExecutor(AgentExecutor):
         # so it must be reused across requests of the same context.
         agent = self._agents.get(context_id) 
         if agent is None:
-            agent = await self._build_agent()
+            agent = await _build_agent(self._api_key,self._model)
             self._agents[context_id] = agent
 
         awaiting_confirmation = False
@@ -765,13 +768,18 @@ class AgentScopeExecutor(AgentExecutor):
         # the terminal update can carry a full `details` snapshot.
         thinking_buff: dict[str, str] = {}   
 
-        
 
 
         async for event in agent.reply_stream(agent_input):
             if isinstance(event, TextBlockDeltaEvent):
                 await emit_agent_message(updater, [Part(text=event.delta)])
-                await emit_agent_message(updater,[part for part in stream_response_to_parts(a2ui_stream,[event.delta])])
+
+                if a2ui_stream:
+                    parts = to_a2a_parts(a2ui_stream.feed(event.delta),version=A2UI_VERSION)
+                    for part in parts:
+                        if part.WhichOneof('content')=='data':
+                            await emit_agent_message(updater, [part])
+
 
             elif isinstance(event, DataBlockDeltaEvent):
                 await emit_agent_message(updater, [
@@ -790,7 +798,6 @@ class AgentScopeExecutor(AgentExecutor):
                         _stable_surface_id('thinking', task.id,event.block_id),
                         _thinking_component("Thinking…", "thinking"),
                     )
-                print(f"Thinking block started: {event.block_id}")
             elif isinstance(event, ThinkingBlockDeltaEvent):
                 if is_supports_a2ui:
                     thinking_buff[event.block_id] = (thinking_buff.get(event.block_id, "") + event.delta)
@@ -803,7 +810,13 @@ class AgentScopeExecutor(AgentExecutor):
                         _thinking_component("Thinking…", "thinking", event.delta),
                     )
 
-                    await emit_agent_message(updater,[part for part in stream_response_to_parts(a2ui_stream,[event.delta])])
+                if a2ui_stream:
+                    parts = to_a2a_parts(a2ui_stream.feed(event.delta),version=A2UI_VERSION)
+                    for part in parts:
+                        if part.WhichOneof('content')=='data':
+                            await emit_agent_message(updater, [part])
+
+                        
             elif isinstance(event, ThinkingBlockEndEvent):
                 if is_supports_a2ui:
                     # Terminal full snapshot: an explicit `details` restores
@@ -854,8 +867,12 @@ class AgentScopeExecutor(AgentExecutor):
                         ),
                     )
             elif isinstance(event, ToolResultStartEvent):
-                tool_progress[event.tool_call_id]["name"] = event.tool_call_name
-                tool_progress[event.tool_call_id]["status"] = "running"
+                tool_progress[event.tool_call_id] = {
+                    "name": event.tool_call_name,
+                    "status": "running",
+                    "result": "",
+                    "status_text":""
+                }
 
                 if is_supports_a2ui:
                     await emit_component(
@@ -892,10 +909,10 @@ class AgentScopeExecutor(AgentExecutor):
                             _tool_component(
                                 name= state["name"],
                                 status= state["status"],
-                                result= state["result"],
-                                status_text =  state["statusText"]
-                            ),
-                        )
+                                result= state.get("result"),
+                                status_text =  state.get("statusText")
+                        ),
+                    )
             
             elif isinstance(event, RequireUserConfirmEvent):
                 awaiting_confirmation = True
@@ -931,10 +948,9 @@ class AgentScopeExecutor(AgentExecutor):
             # The stream holds back text that might start a tag; close it to
             # get the final parts of the reply.
             try:
-                for stream_part in a2ui_stream.close():
-                    if isinstance(stream_part, A2uiPart):
-                        await emit_agent_message(updater,[create_a2ui_part(message)  for message in to_message_dicts(stream_part.a2ui)])
-
+                parts = to_a2a_parts(a2ui_stream.close(),A2UI_VERSION)
+                if parts:
+                    await emit_agent_message(updater, parts)
             except A2uiError as e:
                 logger.warning("A2UI stream close failed: %s", e)
 
