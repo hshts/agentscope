@@ -72,6 +72,9 @@ from agentscope.event import (
     ToolResultEndEvent,
     ToolResultStartEvent,
     ToolResultTextDeltaEvent,
+    DataBlockStartEvent,
+    DataBlockDeltaEvent,
+    DataBlockEndEvent,
 
 )
 from agentscope.mcp import MCPClient, StdioMCPConfig
@@ -91,10 +94,12 @@ from a2ui.parser import (
     StreamPart,
     TextPart,
 )
-from a2ui.processor import A2uiGenerator, CatalogConfig, A2uiRequestProcessor
+from a2ui.processor import A2uiGenerator, CatalogConfig
+from a2ui.a2a import create_a2ui_part,to_a2a_parts,parse_content_to_parts,stream_response_to_parts
 
 
-A2UI_VERSION = "1.0"
+
+A2UI_VERSION = ProtocolVersion.V1_0
 A2UI_MIME_TYPE = "application/a2ui+json"
 # v0.8 and v0.9 renderers tag their parts with this deprecated type.
 A2UI_DEPRECATED_MIME_TYPE = "application/json+a2ui"
@@ -126,18 +131,18 @@ parser = cast(Parser, _processor.parser)
 
 logger = logging.getLogger(__name__)
 
-def _a2ui_to_part(a2ui: Any) -> Part:
-    """Encode a single A2UI 1.0 message as an A2A DataPart.
+def _a2ui_to_part(a2ui: dict[str, Any] | list[Any]) -> Part:
+    """Encode an A2UI 1.0 message (or message list) as an A2A DataPart.
 
     ``ParseDict`` accepts a dict or a list at runtime, but its type stub
     only declares ``dict[str, Any]``.
     """
     return Part(
-        data=json_format.ParseDict(a2ui, struct_pb2.Value()),
-        metadata=json_format.ParseDict(
-            {"mimeType": A2UI_MIME_TYPE},
-            struct_pb2.Struct(),
+        data=json_format.ParseDict(
+            cast(Any, a2ui),
+            struct_pb2.Value(),
         ),
+        metadata={"mimeType": A2UI_MIME_TYPE},
         media_type=A2UI_MIME_TYPE,
     )
 
@@ -157,37 +162,21 @@ def _part_to_a2ui(part: Part | types_v03.Part | None) -> Any:
     return json_format.MessageToDict(part.data)
 
 
-def _to_a2a_parts(response_parts: Sequence[ResponsePart]) -> list[Part]:
-    """Convert parsed model output into text parts and A2UI DataParts."""
-    parts: list[Part] = []
-    for response_part in response_parts:
-        if isinstance(response_part, TextPart):
-            if response_part.text:
-                parts.append(Part(text=response_part.text))
-        elif isinstance(response_part, A2uiPart):
-            for message in to_message_dicts(response_part.a2ui):
-                parts.append(_a2ui_to_part(message))
-    return parts
-
-
-def _stream_part_to_a2a_parts(stream_part: StreamPart) -> list[Part]:
-    """Convert one response-stream part into A2A parts.
-
-    Stream TextParts are skipped: ``emit_text`` already forwards the raw model
-    text, so only the compiled A2UI blocks need to be sent towards the end.
-    """
-    if isinstance(stream_part, A2uiPart):
-        return [
-            _a2ui_to_part(message)
-            for message in to_message_dicts(stream_part.a2ui)
-        ]
-    if isinstance(stream_part, ErrorPart):
-        logger.warning("A2UI stream rejected a block: %s", stream_part.error)
-    return []
+def _to_a2a_parts(parts: Sequence[ResponsePart]) -> list[Part]:
+    """Convert a sequence of A2UI response parts into A2A message parts."""
+    a2a_parts: list[Part] = []
+    for a2ui_part in parts:
+        if isinstance(a2ui_part, TextPart):
+            a2a_parts.append(Part(text=a2ui_part.text))
+        elif isinstance(a2ui_part, A2uiPart):
+            for message in to_message_dicts(a2ui_part.a2ui):
+                a2a_parts.append(_a2ui_to_part(message))
+    return a2a_parts
 
 
 
-def _a2ui_extension() -> AgentExtension:
+
+def _agent_a2ui_extension() -> AgentExtension:
     """Advertise the A2UI 1.0 extension and the catalogs this agent produces."""
     return AgentExtension(
         uri=A2UI_EXTENSION_URI,
@@ -218,7 +207,7 @@ def _create_agent_card(base_url: str) -> AgentCard:
         ],
         capabilities=AgentCapabilities(
             streaming=True,
-            extensions=[_a2ui_extension()],
+            extensions=[_agent_a2ui_extension()],
         ),
         default_input_modes=["text/plain", A2UI_MIME_TYPE],
         default_output_modes=["text/plain", A2UI_MIME_TYPE],
@@ -559,7 +548,6 @@ class AgentScopeExecutor(AgentExecutor):
 
 
 
-
     async def _emit_component(
         self,
         task: Task,
@@ -715,9 +703,7 @@ class AgentScopeExecutor(AgentExecutor):
         else:
             logger.info("Context %s: reusing parked agent", context_id)
 
-
         awaiting_confirmation = False
-
         task = context.current_task
         if task is None:
             # The task manager saves this exact object, so metadata
@@ -804,12 +790,6 @@ class AgentScopeExecutor(AgentExecutor):
                         if isinstance(part,A2uiPart):
                             for message in to_message_dicts(part.a2ui):
                                 await emit_part(_a2ui_to_part(message))
-                                print(f"Emitting A2UI message: {message}")
-                                print(f"Emitting A2UI message as dict: {_a2ui_to_part(message)}")
-                            # print(f"Emitting A2UI part: {message}")
-                            # print(f"Emitting A2UI part as dict: {to_message_dicts(part.a2ui)}")
-                            # print(f"Emitting A2UI part as A2A Part: {_a2ui_to_part(to_message_dicts(part.a2ui))}")
-                            # await emit_part(_a2ui_to_part(to_message_dicts(part.a2ui)))
 
                 except A2uiError as e:
                     logger.warning("A2UI parse failed, sending raw text: %s", e)
@@ -948,28 +928,36 @@ class AgentScopeExecutor(AgentExecutor):
                     is_supports_a2ui,
                 )
 
+            elif isinstance(event, DataBlockDeltaEvent):
+                await emit_part(
+                    Part(
+                        data=event.model_dump(mode="json"),
+                        metadata={"mimeType": event.media_type},
+                        media_type=event.media_type,
+                    ),
+                )
 
+        if a2ui_stream is not None and not awaiting_confirmation:
+            # The stream holds back text that might start a tag; close it to
+            # get the final parts of the reply.
+            try:
+                for stream_part in a2ui_stream.close():
+                    if isinstance(stream_part, A2uiPart):
+                        for message in to_message_dicts(stream_part.a2ui):
+                            await emit_part(_a2ui_to_part(message))
+            except A2uiError as e:
+                logger.warning("A2UI stream close failed: %s", e)
 
-        # if a2ui_stream is not None and not awaiting_confirmation:
-        #     # The stream holds back text that might start a tag; close it to
-        #     # get the final parts of the reply.
-        #     try:
-        #         for stream_part in a2ui_stream.close():
-        #             for part in _stream_part_to_a2a_parts(stream_part):
-        #                 await emit_part(part)
-        #     except A2uiError as e:
-        #         logger.warning("A2UI stream close failed: %s", e)
-
-        # if parser is not None and not streaming and buffered:
-        #     try:
-        #         parts = _to_a2a_parts(_processor.parse_response(buffered))
-        #     except A2uiError as e:
-        #         # Fall back to plain text when the model emits invalid DSL
-        #         # instead of failing the whole task.
-        #         logger.warning("A2UI parse failed, sending raw text: %s", e)
-        #         parts = [Part(text=buffered)]
-        #     for part in parts:
-        #         await emit_part(part)
+        if parser is not None and not streaming and buffered:
+            try:
+                parts = _to_a2a_parts(_processor.parse_response(buffered))
+            except A2uiError as e:
+                # Fall back to plain text when the model emits invalid DSL
+                # instead of failing the whole task.
+                logger.warning("A2UI parse failed, sending raw text: %s", e)
+                parts = [Part(text=buffered)]
+            for part in parts:
+                await emit_part(part)
 
         if not awaiting_confirmation:
             await updater.complete()

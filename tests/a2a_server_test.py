@@ -43,6 +43,7 @@ from examples.a2a.server import (
     _create_agent_card,
     _extract_a2ui_actions,
     _human_confirm_component,
+    _part_to_a2ui,
 )
 
 
@@ -160,6 +161,34 @@ class A2AServerTest(IsolatedAsyncioTestCase):
         self.assertIn(AGENT_CATALOG_ID, params["supportedCatalogIds"])
         self.assertIn("application/a2ui+json", card.default_output_modes)
         self.assertIn("application/a2ui+json", card.default_input_modes)
+
+    def test_a2ui_to_part_encodes_dict_and_list_payloads(self) -> None:
+        message = {
+            "version": "v1.0",
+            "createSurface": {
+                "surfaceId": "s-1",
+                "catalogId": AGENT_CATALOG_ID,
+                "components": [{"component": "Text", "text": "hi"}],
+            },
+        }
+
+        part = _a2ui_to_part(message)
+        self.assertEqual(part.WhichOneof("content"), "data")
+        self.assertEqual(part.media_type, A2UI_MIME_TYPE)
+        self.assertEqual(
+            json_format.MessageToDict(part.metadata),
+            {"mimeType": A2UI_MIME_TYPE},
+        )
+        self.assertEqual(json_format.MessageToDict(part.data), message)
+        self.assertEqual(_part_to_a2ui(part), message)
+
+        batch = [
+            message,
+            {"version": "v1.0", "deleteSurface": {"surfaceId": "s-1"}},
+        ]
+        batch_part = _a2ui_to_part(batch)
+        self.assertEqual(json_format.MessageToDict(batch_part.data), batch)
+        self.assertEqual(_part_to_a2ui(batch_part), batch)
 
     def test_confirmation_component_and_action_data_part(self) -> None:
         tool_call = ToolCallBlock(
