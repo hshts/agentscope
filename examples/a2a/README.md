@@ -68,7 +68,9 @@ A2UI `action` DataPart (or a plain text reply) whose decision is mapped
 directly into a single AgentScope `UserConfirmResultEvent` covering all the
 pending tool calls of that confirmation. The event name must be
 `agentscope.tool.confirm` or `agentscope.tool.reject`; a plain-text client can
-instead reply exactly `yes` or `no`. Text responses are sent in agent `Message`
+instead reply exactly `yes` or `no`. Once that decision is accepted, the server
+removes the matching `HumanConfirm` surfaces with `deleteSurface` before the
+resumed reply continues, so the renderer only shows the resumed activity. Text responses are sent in agent `Message`
 objects on `working` status updates, while thinking and activity surfaces
 (including the confirmation cards) are published as A2UI artifact chunks.
 

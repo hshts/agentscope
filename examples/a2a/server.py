@@ -368,11 +368,10 @@ def _stable_surface_id(kind: str, task_id: str, item_id: str = "") -> str:
 
 
 def _tool_component(
-    *,
     name: str,
     status: str,
-    arguments: str = "",
-    result: str = "",
+    arguments: str | None = None,
+    result: str | None = None,
     status_text: str | None = None,
 ) -> dict[str, Any]:
     """Build a ToolCall component using the custom catalog's property names."""
@@ -441,19 +440,140 @@ def _human_confirm_component(tool_call: ToolCallBlock) -> dict[str, Any]:
     }
 
 
-async def _emit_agent_message(
+
+async def emit_component(
+    task: Task,
+    updater: TaskUpdater,
+    surface_id: str,
+    component: dict[str, Any],
+) -> None:
+    """Create or update a custom-catalog component surface."""
+    surfaces = _task_surfaces(task)
+    if surface_id in surfaces:
+        envelope = {
+            "version": A2UI_VERSION,
+            "updateComponents": {
+                "surfaceId": surface_id,
+                "components": [component],
+            },
+        }
+    else:
+        envelope = {
+            "version": A2UI_VERSION,
+            "createSurface": {
+                "surfaceId": surface_id,
+                "catalogId": AGENT_CATALOG_ID,
+                "components": [component],
+            },
+        }
+    await emit_agent_message(updater,[_a2ui_to_part(envelope)],)
+    _save_task_surfaces(task, surfaces | {surface_id})
+
+
+
+async def emit_confirmation(
+    task: Task,
+    updater: TaskUpdater,
+    confirmation: RequireUserConfirmEvent,
+    is_supports_a2ui: bool,
+) -> None:
+    """Present the confirmation and park the A2A task at input-required."""
+    if is_supports_a2ui:
+        for tool_call in confirmation.tool_calls:
+            await emit_component(
+                task,
+                updater,
+                _stable_surface_id("confirm", task.id, tool_call.id),
+                _human_confirm_component(tool_call),
+            )
+        await updater.requires_input()
+    else:
+        tool_call = confirmation.tool_calls[0]
+        prompt = (
+            f"Allow tool {tool_call.name} with arguments "
+            f"{tool_call.input or '{}'}? Reply yes or no."
+        )
+        await updater.requires_input(
+            updater.new_agent_message([Part(text=prompt)]),
+        )
+
+
+async def emit_delete_surfaces(
+    task: Task,
+    updater: TaskUpdater,
+    confirmation_result: UserConfirmResultEvent | None,
+) -> None:
+    """Remove confirmation cards after their result is accepted.
+
+    Only surfaces already created for the pending tool calls are deleted,
+    and their IDs are dropped from the task metadata so the card is
+    recreated if the same tool call asks for confirmation again.
+    """
+    surfaces = _task_surfaces(task)
+    results = (
+        confirmation_result.confirm_results
+        if confirmation_result is not None
+        else []
+    )
+    for result in results:
+        surface_id = _stable_surface_id(
+            "confirm",
+            task.id,
+            result.tool_call.id,
+        )
+        if surface_id not in surfaces:
+            continue
+        await emit_agent_message(
+            updater,
+            [
+                _a2ui_to_part({
+                    "version": A2UI_VERSION,
+                    "deleteSurface": {"surfaceId": surface_id},
+                }),
+            ],
+        
+        )
+        surfaces.remove(surface_id)
+    _save_task_surfaces(task, surfaces)
+
+
+async def emit_agent_message(
     updater: TaskUpdater,
     parts: Sequence[Part],
-    extensions: Sequence[str] = (),
 ) -> None:
     """Send agent output as an A2A Message on a working status update."""
     message = updater.new_agent_message(list(parts))
-    if extensions:
-        message.extensions.extend(extensions)
+    message.extensions.extend(A2UI_EXTENSION_URI)
     await updater.update_status(
         TaskState.TASK_STATE_WORKING,
         message=message,
     )
+
+
+SURFACES_KEY = "a2uiSurfaces"
+PENDING_CONFIRM_KEY = "pendingConfirmation"
+
+
+def _task_metadata(task: Task) -> dict[str, Any]:
+    """Read the task metadata as a plain dict."""
+    return json_format.MessageToDict(task.metadata)
+
+
+def _update_task_metadata(task: Task, updates: dict[str, Any]) -> None:
+    """Merge ``updates`` into the task metadata, keeping other keys."""
+    merged = {**_task_metadata(task), **updates}
+    task.metadata.CopyFrom(json_format.ParseDict(merged, struct_pb2.Struct()))
+
+
+def _task_surfaces(task: Task) -> set[str]:
+    """Read the set of emitted A2UI surface IDs from the task metadata."""
+    return set(_task_metadata(task).get(SURFACES_KEY, []))
+
+
+def _save_task_surfaces(task: Task, surfaces: set[str]) -> None:
+    """Persist the surface IDs on the task so they survive the request."""
+    _update_task_metadata(task, {SURFACES_KEY: sorted(surfaces)})
+
 
 
 
@@ -474,46 +594,13 @@ class AgentScopeExecutor(AgentExecutor):
         self._agents: dict[str, Agent] = {}
 
 
-    SURFACES_KEY = "a2uiSurfaces"
-    PENDING_CONFIRM_KEY = "pendingConfirmation"
-
-    @classmethod
-    def _task_metadata(cls, task: Task) -> dict[str, Any]:
-        """Read the task metadata as a plain dict."""
-        return json_format.MessageToDict(task.metadata)
-
-    @classmethod
-    def _update_task_metadata(
-        cls,
-        task: Task,
-        updates: dict[str, Any],
-    ) -> None:
-        """Merge ``updates`` into the task metadata, keeping other keys."""
-        merged = {**cls._task_metadata(task), **updates}
-        task.metadata.CopyFrom(
-            json_format.ParseDict(merged, struct_pb2.Struct()),
-        )
-
-    @classmethod
-    def _task_surfaces(cls, task: Task) -> set[str]:
-        """Read the set of emitted A2UI surface IDs from the task metadata."""
-        return set(cls._task_metadata(task).get(cls.SURFACES_KEY, []))
-
-    @classmethod
-    def _save_task_surfaces(cls, task: Task, surfaces: set[str]) -> None:
-        """Persist the surface IDs on the task so they survive the request."""
-        cls._update_task_metadata(
-            task,
-            {cls.SURFACES_KEY: sorted(surfaces)},
-        )
-
     @classmethod
     def _task_pending_confirm(
         cls,
         task: Task,
     ) -> RequireUserConfirmEvent | None:
         """Rebuild the parked confirmation from the task metadata."""
-        data = cls._task_metadata(task).get(cls.PENDING_CONFIRM_KEY)
+        data = _task_metadata(task).get(PENDING_CONFIRM_KEY)
         if not data:
             return None
         return RequireUserConfirmEvent(
@@ -531,12 +618,12 @@ class AgentScopeExecutor(AgentExecutor):
     ) -> None:
         """Persist (or clear) the parked confirmation on the task metadata."""
         if confirmation is None:
-            cls._update_task_metadata(task, {cls.PENDING_CONFIRM_KEY: None})
+            _update_task_metadata(task, {PENDING_CONFIRM_KEY: None})
             return
-        cls._update_task_metadata(
+        _update_task_metadata(
             task,
             {
-                cls.PENDING_CONFIRM_KEY: {
+                PENDING_CONFIRM_KEY: {
                     "reply_id": confirmation.reply_id,
                     "tool_calls": [
                         tool_call.model_dump(mode="json")
@@ -545,97 +632,6 @@ class AgentScopeExecutor(AgentExecutor):
                 },
             },
         )
-
-
-
-    async def _emit_component(
-        self,
-        task: Task,
-        updater: TaskUpdater,
-        surface_id: str,
-        component: dict[str, Any],
-    ) -> None:
-        """Create or update a custom-catalog component surface."""
-        surfaces = self._task_surfaces(task)
-        envelope = {}
-        if surface_id in surfaces:
-            envelope = {
-                "version": A2UI_VERSION,
-                "updateComponents": {
-                    "surfaceId": surface_id,
-                    "components": [component],
-                },
-            }
-        else:
-            envelope = {
-                "version": A2UI_VERSION,
-                "createSurface": {
-                    "surfaceId": surface_id,
-                    "catalogId": AGENT_CATALOG_ID,
-                    "components": [component],
-                },
-            }
-        await _emit_agent_message(
-            updater,
-            [_a2ui_to_part(envelope)],
-            extensions=[A2UI_EXTENSION_URI],
-        )
-        self._save_task_surfaces(task, surfaces | {surface_id})
-
-    async def _emit_confirmation(
-        self,
-        task: Task,
-        updater: TaskUpdater,
-        confirmation: RequireUserConfirmEvent,
-        is_supports_a2ui: bool,
-    ) -> None:
-        """Present the confirmation and park the A2A task at input-required."""
-        if is_supports_a2ui:
-            for tool_call in confirmation.tool_calls:
-                await self._emit_component(
-                    task,
-                    updater,
-                    _stable_surface_id("confirm", task.id, tool_call.id),
-                    _human_confirm_component(tool_call),
-                )
-            await updater.requires_input()
-        else:
-            tool_call = confirmation.tool_calls[0]
-            prompt = (
-                f"Allow tool {tool_call.name} with arguments "
-                f"{tool_call.input or '{}'}? Reply yes or no."
-            )
-            await updater.requires_input(
-                updater.new_agent_message([Part(text=prompt)]),
-            )
-
-    async def _emit_delete_surfaces(
-        self,
-        task: Task,
-        updater: TaskUpdater,
-        confirmresultevent: UserConfirmResultEvent | None,
-    ) -> None:
-        """Remove confirmation cards after their result is accepted."""
-        surfaces = self._task_surfaces(task)
-        for result in confirmresultevent.confirm_results if confirmresultevent is not None else []:
-            surface_id = _stable_surface_id(
-                "confirm",
-                task.id,
-                result.tool_call.id,
-            )
-            if surface_id not in surfaces:
-                continue
-            await updater.add_artifact(
-                [
-                    _a2ui_to_part({
-                        "version": A2UI_VERSION,
-                        "deleteSurface": {"surfaceId": surface_id},
-                    }),
-                ],
-                extensions=[A2UI_EXTENSION_URI],
-            )
-            surfaces.remove(surface_id)
-        self._save_task_surfaces(task, surfaces)
 
 
     async def _build_agent(self,) -> Agent:
@@ -672,7 +668,10 @@ class AgentScopeExecutor(AgentExecutor):
                     ),
                     model=self._model,
                     stream=True,
+                    parameters= VolcengineChatModel.Parameters(thinking_enable=True),
                 ),
+
+
                 toolkit=toolkit,
       
             )
@@ -695,13 +694,10 @@ class AgentScopeExecutor(AgentExecutor):
         task_id = context.task_id
         # The agent is what remembers the parked reply awaiting confirmation,
         # so it must be reused across requests of the same context.
-        agent = self._agents.get(context_id)
+        agent = self._agents.get(context_id) 
         if agent is None:
             agent = await self._build_agent()
             self._agents[context_id] = agent
-            logger.info("Context %s: built new agent", context_id)
-        else:
-            logger.info("Context %s: reusing parked agent", context_id)
 
         awaiting_confirmation = False
         task = context.current_task
@@ -746,6 +742,9 @@ class AgentScopeExecutor(AgentExecutor):
 
         if isinstance(user_input, UserConfirmResultEvent):
             agent_input = user_input
+            # The user answered: drop the cards that asked for the decision so
+            # the renderer only shows the resumed tool activity.
+            await emit_delete_surfaces(task, updater, user_input)
         else:
             agent_input = UserMsg(name="user", content=user_input)
         streaming = bool(parser is not None and parser.supports_streaming)
@@ -764,103 +763,63 @@ class AgentScopeExecutor(AgentExecutor):
         tool_progress: dict[str, dict[str, Any]] = {}
         # Reasoning accumulated server-side, keyed by thinking block id, so
         # the terminal update can carry a full `details` snapshot.
-        thinking_text: dict[str, str] = {}   
-        async def emit_part(part: Part) -> None:
-            """Send one response part as an agent message."""
-            if part.WhichOneof("content") == "text":
-                if not part.text:
-                    return
-                await _emit_agent_message(updater, [part])
-                return
-            await _emit_agent_message(
-                updater,
-                [part],
-                extensions=[A2UI_EXTENSION_URI],
-            )
+        thinking_buff: dict[str, str] = {}   
 
-        async def handle_a2ui(text: str) -> None:
-            """Stream model text, splitting out the A2UI blocks it carries."""
-            nonlocal buffered
-            if not streaming:
-                buffered += text
-                return
-            elif a2ui_stream is not None:
-                try:
-                    for part in a2ui_stream.feed(text):
-                        if isinstance(part,A2uiPart):
-                            for message in to_message_dicts(part.a2ui):
-                                await emit_part(_a2ui_to_part(message))
-
-                except A2uiError as e:
-                    logger.warning("A2UI parse failed, sending raw text: %s", e)
-                    buffered += text
-                except ValueError as e:
-                    # The stream is closed (an earlier block was rejected and
-                    # after_rejected_block did not apply); keep the raw text.
-                    logger.warning("A2UI stream no longer accepts text: %s", e)
+        
 
 
-        async def emit_tool(tool_call_id: str) -> None:
-            state = tool_progress[tool_call_id]
-            await self._emit_component(
-                task,
-                updater,
-                _stable_surface_id("tool", task.id, tool_call_id),
-                _tool_component(
-                    name=state["name"],
-                    status=state["status"],
-                    arguments=state["arguments"],
-                    result=state["result"],
-                    status_text=state.get("statusText"),
-                ),
-            )
-
-  
         async for event in agent.reply_stream(agent_input):
             if isinstance(event, TextBlockDeltaEvent):
-                await emit_part(Part(text=event.delta))
-                await handle_a2ui(event.delta)
+                await emit_agent_message(updater, [Part(text=event.delta)])
+                await emit_agent_message(updater,[part for part in stream_response_to_parts(a2ui_stream,[event.delta])])
+
+            elif isinstance(event, DataBlockDeltaEvent):
+                await emit_agent_message(updater, [
+                    Part(
+                        data=event.model_dump(mode="json"),
+                        metadata={"mimeType": event.media_type},
+                        media_type=event.media_type,
+                    )
+                ])
+            
             elif isinstance(event, ThinkingBlockStartEvent):
                 if is_supports_a2ui:
-                    await self._emit_component(
+                    await emit_component(
                         task,
                         updater,
                         _stable_surface_id('thinking', task.id,event.block_id),
                         _thinking_component("Thinking…", "thinking"),
                     )
                 print(f"Thinking block started: {event.block_id}")
-
             elif isinstance(event, ThinkingBlockDeltaEvent):
                 if is_supports_a2ui:
-                    thinking_text[event.block_id] = (
-                        thinking_text.get(event.block_id, "") + event.delta
-                    )
+                    thinking_buff[event.block_id] = (thinking_buff.get(event.block_id, "") + event.delta)
                     # Delta only: the client accumulates locally, so the
                     # payload stays O(chunk) regardless of reasoning length.
-                    await handle_a2ui(event.delta)
-                    await self._emit_component(
+                    await emit_component(
                         task,
                         updater,
                         _stable_surface_id('thinking', task.id,event.block_id),
                         _thinking_component("Thinking…", "thinking", event.delta),
                     )
 
-
+                    await emit_agent_message(updater,[part for part in stream_response_to_parts(a2ui_stream,[event.delta])])
             elif isinstance(event, ThinkingBlockEndEvent):
                 if is_supports_a2ui:
                     # Terminal full snapshot: an explicit `details` restores
                     # the reasoning for clients that joined or replayed past
                     # any of the deltas above.
-                    await self._emit_component(
+                    await emit_component(
                         task,
                         updater,
                         _stable_surface_id('thinking', task.id,event.block_id),
                         _thinking_component(
                             "Thinking Done",
                             "done",
-                            details=thinking_text.pop(event.block_id, None),
+                            details=thinking_buff.pop(event.block_id, None),
                         ),
                     )
+                
             elif isinstance(event, ToolCallStartEvent):
                 tool_progress[event.tool_call_id] = {
                     "name": event.tool_call_name,
@@ -869,27 +828,45 @@ class AgentScopeExecutor(AgentExecutor):
                     "result": "",
                 }
                 if is_supports_a2ui:
-                    await emit_tool(event.tool_call_id)
+                    await emit_component(
+                        task,
+                        updater,
+                        _stable_surface_id('tool', task.id,event.tool_call_id),
+                        _tool_component(
+                            name = event.tool_call_name,
+                            status= "pending",
+                        ),
+                    )
+                
             elif isinstance(event, ToolCallDeltaEvent):
                 tool_progress[event.tool_call_id]["arguments"] += event.delta
             elif isinstance(event, ToolCallEndEvent):
                 tool_progress[event.tool_call_id]["status"] = "running"
                 if is_supports_a2ui:
-                    await emit_tool(event.tool_call_id)
+                    await emit_component(
+                        task,
+                        updater,
+                        _stable_surface_id('tool', task.id,event.tool_call_id),
+                        _tool_component(
+                            name= tool_progress[event.tool_call_id]["name"],
+                            status= "pending",
+                            arguments = tool_progress[event.tool_call_id]["arguments"],
+                        ),
+                    )
             elif isinstance(event, ToolResultStartEvent):
-                state = tool_progress.setdefault(
-                    event.tool_call_id,
-                    {
-                        "name": event.tool_call_name,
-                        "status": "running",
-                        "arguments": "",
-                        "result": "",
-                    },
-                )
-                state["name"] = event.tool_call_name
-                state["status"] = "running"
+                tool_progress[event.tool_call_id]["name"] = event.tool_call_name
+                tool_progress[event.tool_call_id]["status"] = "running"
+
                 if is_supports_a2ui:
-                    await emit_tool(event.tool_call_id)
+                    await emit_component(
+                        task,
+                        updater,
+                        _stable_surface_id('tool', task.id,event.tool_call_id),
+                        _tool_component(
+                            name= event.tool_call_name,
+                            status= "running",
+                        ),
+                    )
             elif isinstance(event, ToolResultTextDeltaEvent):
                 if event.tool_call_id in tool_progress:
                     tool_progress[event.tool_call_id]["result"] += event.delta
@@ -908,7 +885,18 @@ class AgentScopeExecutor(AgentExecutor):
                     if state["status"] == "error":
                         state["statusText"] = str(result_state).title()
                     if is_supports_a2ui:
-                        await emit_tool(event.tool_call_id)
+                        await emit_component(
+                            task,
+                            updater,
+                            _stable_surface_id('tool', task.id,event.tool_call_id),
+                            _tool_component(
+                                name= state["name"],
+                                status= state["status"],
+                                result= state["result"],
+                                status_text =  state["statusText"]
+                            ),
+                        )
+            
             elif isinstance(event, RequireUserConfirmEvent):
                 awaiting_confirmation = True
                 self._set_task_pending_confirm(task, event)
@@ -920,22 +908,24 @@ class AgentScopeExecutor(AgentExecutor):
                         "result": "",
                     }
                     if is_supports_a2ui:
-                        await emit_tool(tool_call.id)
-                await self._emit_confirmation(
+                        await emit_component(
+                            task,
+                            updater,
+                            _stable_surface_id('tool', task.id,tool_call.id),
+                            _tool_component(
+                                name= tool_call.name,
+                                status= 'pending',
+                                arguments= tool_call.input,
+                                result= "",
+                            ),
+                        )
+                await emit_confirmation(
                     task,
                     updater,
                     event,
                     is_supports_a2ui,
                 )
 
-            elif isinstance(event, DataBlockDeltaEvent):
-                await emit_part(
-                    Part(
-                        data=event.model_dump(mode="json"),
-                        metadata={"mimeType": event.media_type},
-                        media_type=event.media_type,
-                    ),
-                )
 
         if a2ui_stream is not None and not awaiting_confirmation:
             # The stream holds back text that might start a tag; close it to
@@ -943,21 +933,25 @@ class AgentScopeExecutor(AgentExecutor):
             try:
                 for stream_part in a2ui_stream.close():
                     if isinstance(stream_part, A2uiPart):
-                        for message in to_message_dicts(stream_part.a2ui):
-                            await emit_part(_a2ui_to_part(message))
+                        await emit_agent_message(updater,[create_a2ui_part(message)  for message in to_message_dicts(stream_part.a2ui)])
+
             except A2uiError as e:
                 logger.warning("A2UI stream close failed: %s", e)
 
         if parser is not None and not streaming and buffered:
             try:
-                parts = _to_a2a_parts(_processor.parse_response(buffered))
+                parts = parse_content_to_parts(
+                    buffered,
+                    parser,
+                    fallback_text=buffered,
+                )
             except A2uiError as e:
                 # Fall back to plain text when the model emits invalid DSL
                 # instead of failing the whole task.
                 logger.warning("A2UI parse failed, sending raw text: %s", e)
                 parts = [Part(text=buffered)]
-            for part in parts:
-                await emit_part(part)
+            if parts:
+                await emit_agent_message(updater, parts)
 
         if not awaiting_confirmation:
             await updater.complete()

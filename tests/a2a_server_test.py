@@ -13,7 +13,6 @@ from a2a.types import (
     Task,
     TaskArtifactUpdateEvent,
     TaskState,
-    TaskStatus,
     TaskStatusUpdateEvent,
 )
 from a2a.server.agent_execution import RequestContext
@@ -35,6 +34,7 @@ from agentscope.message import ToolCallBlock, ToolCallState, ToolResultState
 from examples.a2a.server import (
     A2UI_EXTENSION_URI,
     A2UI_MIME_TYPE,
+    A2UI_VERSION,
     AGENT_CATALOG_ID,
     CONFIRM_ACTION,
     REJECT_ACTION,
@@ -51,7 +51,8 @@ def _renderer_metadata() -> struct_pb2.Struct:
     return json_format.ParseDict(
         {
             "a2uiRendererCapabilities": {
-                "v1.0": {
+                # Renderer capabilities are keyed by the A2UI spec version.
+                A2UI_VERSION.value: {
                     "supportedCatalogIds": [AGENT_CATALOG_ID],
                 },
             },
@@ -67,6 +68,34 @@ def _a2ui_messages(part: Part) -> list[dict[str, Any]]:
     ):
         raise AssertionError("Expected an A2UI message list.")
     return payload
+
+
+def _emitted_a2ui_messages(events: list[Any]) -> list[dict[str, Any]]:
+    """Flatten the A2UI messages carried by the executor's events.
+
+    Component surfaces are emitted as a single message object, while
+    model-generated A2UI arrives as a list of messages, so both shapes are
+    normalized here.
+    """
+    messages: list[dict[str, Any]] = []
+    for event in events:
+        if isinstance(event, TaskArtifactUpdateEvent):
+            parts = event.artifact.parts
+        elif isinstance(event, TaskStatusUpdateEvent):
+            if not event.status.HasField("message"):
+                continue
+            parts = event.status.message.parts
+        else:
+            continue
+        for part in parts:
+            payload = _part_to_a2ui(part)
+            if isinstance(payload, dict):
+                messages.append(payload)
+            elif isinstance(payload, list):
+                messages.extend(
+                    item for item in payload if isinstance(item, dict)
+                )
+    return messages
 
 
 class _FakeContext:
@@ -254,23 +283,18 @@ class A2AServerTest(IsolatedAsyncioTestCase):
             first_statuses[-1].status.state,
             TaskState.TASK_STATE_INPUT_REQUIRED,
         )
-        a2ui_parts = [
-            part
-            for event in queue.events
-            if isinstance(event, TaskArtifactUpdateEvent)
-            for part in event.artifact.parts
-            if part.HasField("data")
-        ]
-        self.assertTrue(a2ui_parts)
-        self.assertTrue(
-            any(
+        confirm_surface_ids = [
+            message["createSurface"]["surfaceId"]
+            for message in _emitted_a2ui_messages(queue.events)
+            if any(
                 component["component"] == "HumanConfirm"
-                for part in a2ui_parts
-                for message in _a2ui_messages(part)
-                for surface in [message.get("createSurface", {})]
-                for component in surface.get("components", [])
-            ),
-        )
+                for component in message.get("createSurface", {}).get(
+                    "components",
+                    [],
+                )
+            )
+        ]
+        self.assertEqual(len(confirm_surface_ids), 1)
 
         action_part = _a2ui_to_part(
             [
@@ -283,17 +307,18 @@ class A2AServerTest(IsolatedAsyncioTestCase):
                 },
             ],
         )
+        # The parked confirmation is stored on the task metadata, which is the
+        # same task object the task store hands back on the next request.
+        parked_task = next(
+            event for event in queue.events if isinstance(event, Task)
+        )
         resumed_context = _FakeContext(
             message=Message(
                 role=Role.ROLE_USER,
                 parts=[action_part],
                 metadata=_renderer_metadata(),
             ),
-            current_task=Task(
-                id="task-1",
-                context_id="context-1",
-                status=TaskStatus(state=TaskState.TASK_STATE_INPUT_REQUIRED),
-            ),
+            current_task=parked_task,
         )
 
         await executor.execute(
@@ -303,6 +328,14 @@ class A2AServerTest(IsolatedAsyncioTestCase):
 
         self.assertIsInstance(fake_agent.inputs[-1], UserConfirmResultEvent)
         self.assertTrue(fake_agent.inputs[-1].confirm_results[0].confirmed)
+        self.assertEqual(
+            [
+                message["deleteSurface"]
+                for message in _emitted_a2ui_messages(queue.events)
+                if "deleteSurface" in message
+            ],
+            [{"surfaceId": confirm_surface_ids[0]}],
+        )
         final_statuses = [
             event
             for event in queue.events
@@ -314,11 +347,7 @@ class A2AServerTest(IsolatedAsyncioTestCase):
         )
         rendered_components = [
             component
-            for event in queue.events
-            if isinstance(event, TaskArtifactUpdateEvent)
-            for part in event.artifact.parts
-            if part.HasField("data")
-            for message in _a2ui_messages(part)
+            for message in _emitted_a2ui_messages(queue.events)
             for update in (
                 message.get("createSurface", {}).get("components", [])
                 + message.get("updateComponents", {}).get("components", [])
