@@ -770,7 +770,7 @@ class AgentScopeExecutor(AgentExecutor):
 
 
 
-        async for event in agent.reply_stream(agent_input):
+        async for event in agent.reply_stream(agent_input,yield_final_msg=True):
             if isinstance(event, TextBlockDeltaEvent):
                 await emit_agent_message(updater, [Part(text=event.delta)])
 
@@ -942,7 +942,8 @@ class AgentScopeExecutor(AgentExecutor):
                     event,
                     is_supports_a2ui,
                 )
-
+            elif isinstance(event,Msg):
+                print(f'{event.model_dump(mode="json")}')
 
         if a2ui_stream is not None and not awaiting_confirmation:
             # The stream holds back text that might start a tag; close it to
