@@ -15,6 +15,7 @@ custom-catalog surfaces. Human confirmation pauses the A2A Task in
 """
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -78,7 +79,16 @@ from agentscope.event import (
 
 )
 from agentscope.mcp import MCPClient, StdioMCPConfig
-from agentscope.message import Msg, ToolCallBlock, ToolCallState, UserMsg
+from agentscope.message import (
+    Base64Source,
+    DataBlock,
+    Msg,
+    TextBlock,
+    ToolCallBlock,
+    ToolCallState,
+    URLSource,
+    UserMsg,
+)
 from agentscope.tool import Bash, Edit, Glob, Read, Toolkit, Write
 
 from a2ui.constants import A2UI_ACTIONS_KEY, A2UI_CLIENT_CAPABILITIES_KEY
@@ -147,19 +157,145 @@ logger = logging.getLogger(__name__)
 #     )
 
 
-def _part_to_a2ui(part: Part | types_v03.Part | None) -> Any:
-    """Return the JSON payload of a 1.0 or legacy 0.3 A2UI DataPart."""
+def _core_part(part: Part | types_v03.Part | None) -> Part | None:
+    """Normalize a 1.0 or legacy 0.3 Part to the core 1.0 Part."""
     if part is None:
         return None
     if isinstance(part, types_v03.Part):
-        part = to_core_part(part)
-    if part.WhichOneof("content") != "data":
-        return None
+        return to_core_part(part)
+    return part
+
+
+def _part_mime_type(part: Part) -> str:
+    """Return the MIME type declared by a Part, falling back to its field."""
     metadata = json_format.MessageToDict(part.metadata)
-    mime_type = metadata.get("mimeType") or part.media_type
-    if mime_type not in A2UI_MIME_TYPES:
+    return metadata.get("mimeType") or part.media_type
+
+
+def _part_to_a2ui(part: Part | types_v03.Part | None) -> Any:
+    """Return the JSON payload of a 1.0 or legacy 0.3 A2UI DataPart."""
+    part = _core_part(part)
+    if part is None or part.WhichOneof("content") != "data":
+        return None
+    if _part_mime_type(part) not in A2UI_MIME_TYPES:
         return None
     return json_format.MessageToDict(part.data)
+
+
+def _payload_actions(payload: Any) -> list[dict[str, Any]]:
+    """Read the A2UI actions from a decoded A2UI message or message list."""
+    if payload is None:
+        return []
+
+    actions: list[dict[str, Any]] = []
+    items = payload if isinstance(payload, list) else [payload]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        # v1.0 renderers send `action`, older ones `userAction`.
+        action = item.get(A2UI_ACTIONS_KEY) or item.get("userAction")
+        if not isinstance(action, dict) or not isinstance(
+            action.get("name"),
+            str,
+        ):
+            continue
+        action_context = action.get("context", {})
+        actions.append(
+            {
+                "name": action["name"],
+                "context": (
+                    action_context if isinstance(action_context, dict) else {}
+                ),
+            },
+        )
+    return actions
+
+
+def _raw_part_to_block(part: Part) -> DataBlock | None:
+    """Convert a raw byte Part into an AgentScope DataBlock."""
+    if not part.raw:
+        return None
+    return DataBlock(
+        source=Base64Source(
+            data=base64.b64encode(part.raw).decode("ascii"),
+            media_type=part.media_type or "application/octet-stream",
+        ),
+        name=part.filename or None,
+    )
+
+
+def _url_part_to_block(part: Part) -> DataBlock | None:
+    """Convert a URL Part into an AgentScope DataBlock."""
+    if not part.url:
+        return None
+    return DataBlock(
+        source=URLSource(
+            url=part.url,
+            media_type=part.media_type or "application/octet-stream",
+        ),
+        name=part.filename or None,
+    )
+
+
+def _data_part_to_text(part: Part) -> TextBlock | None:
+    """Convert a non-A2UI data Part into a JSON text block."""
+    payload = json_format.MessageToDict(part.data)
+    if payload in (None, "", [], {}):
+        return None
+    return TextBlock(text=json.dumps(payload, ensure_ascii=False))
+
+
+@dataclass
+class _UserContent:
+    """User content blocks plus the A2UI actions carried by a message."""
+
+    content: list[TextBlock | DataBlock]
+    actions: list[dict[str, Any]]
+
+
+def _extract_user_content(
+    context_or_message: RequestContext | Message,
+) -> _UserContent:
+    """Convert every Part of an A2A user message into ``UserMsg`` content.
+
+    Text Parts become :class:`TextBlock`; raw and URL Parts become
+    :class:`DataBlock`; other data Parts become a JSON :class:`TextBlock`.
+    A2UI DataParts are renderer control payloads: their actions are reported
+    in ``actions`` instead of being passed to the agent as content.
+    """
+    message = _a2a_message(context_or_message)
+    content: list[TextBlock | DataBlock] = []
+    actions: list[dict[str, Any]] = []
+    if message is None:
+        return _UserContent(content=content, actions=actions)
+
+    for raw_part in message.parts:
+        part = _core_part(raw_part)
+        if part is None:
+            continue
+        kind = part.WhichOneof("content")
+        if kind == "text":
+            if part.text:
+                content.append(TextBlock(text=part.text))
+        elif kind == "raw":
+            block = _raw_part_to_block(part)
+            if block is not None:
+                content.append(block)
+        elif kind == "url":
+            block = _url_part_to_block(part)
+            if block is not None:
+                content.append(block)
+        elif kind == "data":
+            payload = _part_to_a2ui(part)
+            if payload is not None:
+                part_actions = _payload_actions(payload)
+                if part_actions:
+                    actions.extend(part_actions)
+                    continue
+            block = _data_part_to_text(part)
+            if block is not None:
+                content.append(block)
+    return _UserContent(content=content, actions=actions)
 
 
 # def _to_a2a_parts(parts: Sequence[ResponsePart]) -> list[Part]:
@@ -328,32 +464,7 @@ def _extract_a2ui_actions(
     context_or_message: RequestContext | Message,
 ) -> list[dict[str, Any]]:
     """Read renderer actions from the A2UI DataParts in the A2A message."""
-    message = _a2a_message(context_or_message)
-    if message is None:
-        return []
-
-    actions: list[dict[str, Any]] = []
-    for part in message.parts:
-        payload = _part_to_a2ui(part)
-        if payload is None:
-            continue
-        items = payload if isinstance(payload, list) else [payload]
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            # v1.0 renderers send `action`, older ones `userAction`.
-            action = item.get(A2UI_ACTIONS_KEY) or item.get("userAction")
-            if not isinstance(action, dict) or not isinstance(
-                action.get("name"),
-                str,
-            ):
-                continue
-            action_context = action.get("context", {})
-            actions.append({
-                "name": action["name"],
-                "context": action_context if isinstance(action_context, dict) else {},
-            })
-    return actions
+    return _extract_user_content(context_or_message).actions
 
 
 def _action_to_query(
@@ -721,8 +832,9 @@ class AgentScopeExecutor(AgentExecutor):
         await updater.start_work()
 
         user_input = context.get_user_input()
+        user_content = _extract_user_content(context)
         is_supports_a2ui = _renderer_is_supports_a2ui(context)
-        actions = _extract_a2ui_actions(context)
+        actions = user_content.actions
         if actions:
                 # The renderer clicked a surface the model generated, so the
                 # action is a normal user turn, not a tool decision.
@@ -749,7 +861,20 @@ class AgentScopeExecutor(AgentExecutor):
             # the renderer only shows the resumed tool activity.
             await emit_delete_surfaces(task, updater, user_input)
         else:
-            agent_input = UserMsg(name="user", content=user_input)
+            content = user_content.content
+            if actions:
+                # ``user_input`` already carries the action names, their
+                # context and the message text, so only attachments are
+                # added from the raw parts.
+                content = [
+                    block for block in content if isinstance(block, DataBlock)
+                ]
+                if user_input.strip():
+                    content.insert(0, TextBlock(text=user_input))
+            elif not content and user_input.strip():
+                # Contexts that only expose ``get_user_input`` (no parts).
+                content = [TextBlock(text=user_input)]
+            agent_input = UserMsg(name="user", content=content)
         streaming = bool(parser is not None and parser.supports_streaming)
   
 
@@ -767,7 +892,6 @@ class AgentScopeExecutor(AgentExecutor):
         # Reasoning accumulated server-side, keyed by thinking block id, so
         # the terminal update can carry a full `details` snapshot.
         thinking_buff: dict[str, str] = {}   
-
 
 
         async for event in agent.reply_stream(agent_input,yield_final_msg=True):
@@ -1033,7 +1157,7 @@ def create_fastapi_app(
         # jsonrpc_routes_v0_3=create_jsonrpc_routes(handler, rpc_url='/v0.3',enable_v0_3_compat=True,),
         # rest_routes_v0_3=create_rest_routes(handler, path_prefix="/rest/v0.3", enable_v0_3_compat=True),
         jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url='/',enable_v0_3_compat=True),
-        rest_routes=create_rest_routes(handler, path_prefix="/rest",enable_v0_3_compat=True),
+        rest_routes=create_rest_routes(handler, path_prefix="",enable_v0_3_compat=True),
    )
     app.add_middleware(
         CORSMiddleware,

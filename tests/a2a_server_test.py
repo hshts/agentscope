@@ -30,7 +30,15 @@ from agentscope.event import (
     ToolResultTextDeltaEvent,
     UserConfirmResultEvent,
 )
-from agentscope.message import ToolCallBlock, ToolCallState, ToolResultState
+from agentscope.message import (
+    Base64Source,
+    DataBlock,
+    TextBlock,
+    ToolCallBlock,
+    ToolCallState,
+    ToolResultState,
+    URLSource,
+)
 from examples.a2a.server import (
     A2UI_EXTENSION_URI,
     A2UI_MIME_TYPE,
@@ -39,12 +47,21 @@ from examples.a2a.server import (
     CONFIRM_ACTION,
     REJECT_ACTION,
     AgentScopeExecutor,
-    _a2ui_to_part,
     _create_agent_card,
     _extract_a2ui_actions,
+    _extract_user_content,
     _human_confirm_component,
     _part_to_a2ui,
 )
+
+
+def _a2ui_to_part(a2ui: dict[str, Any] | list[Any]) -> Part:
+    """Encode an A2UI message (or message list) as an A2A DataPart."""
+    return Part(
+        data=json_format.ParseDict(cast(Any, a2ui), struct_pb2.Value()),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+        media_type=A2UI_MIME_TYPE,
+    )
 
 
 def _renderer_metadata() -> struct_pb2.Struct:
@@ -133,7 +150,7 @@ class _FakeAgent:
             input='{"recipient":"user@example.com"}',
         )
 
-    async def reply_stream(self, inputs: Any):
+    async def reply_stream(self, inputs: Any, yield_final_msg: bool = False):
         self.inputs.append(inputs)
         if isinstance(inputs, UserConfirmResultEvent):
             yield ToolResultStartEvent(
@@ -218,6 +235,75 @@ class A2AServerTest(IsolatedAsyncioTestCase):
         batch_part = _a2ui_to_part(batch)
         self.assertEqual(json_format.MessageToDict(batch_part.data), batch)
         self.assertEqual(_part_to_a2ui(batch_part), batch)
+
+    def test_extract_user_content_converts_all_part_kinds(self) -> None:
+        message = Message(
+            role=Role.ROLE_USER,
+            parts=[
+                Part(text="look at these"),
+                Part(raw=b"abc", media_type="image/png", filename="a.png"),
+                Part(
+                    url="https://example.com/report.pdf",
+                    media_type="application/pdf",
+                    filename="report.pdf",
+                ),
+                Part(
+                    data=json_format.ParseDict(
+                        {"count": 2}, struct_pb2.Value()
+                    ),
+                    media_type="application/json",
+                ),
+            ],
+        )
+
+        content = _extract_user_content(message)
+
+        self.assertEqual(content.actions, [])
+        self.assertEqual(
+            [type(block) for block in content.content],
+            [TextBlock, DataBlock, DataBlock, TextBlock],
+        )
+        self.assertEqual(content.content[0].text, "look at these")
+        self.assertIsInstance(content.content[1].source, Base64Source)
+        self.assertEqual(content.content[1].source.data, "YWJj")
+        self.assertEqual(content.content[1].source.media_type, "image/png")
+        self.assertEqual(content.content[1].name, "a.png")
+        self.assertIsInstance(content.content[2].source, URLSource)
+        self.assertEqual(
+            str(content.content[2].source.url),
+            "https://example.com/report.pdf",
+        )
+        self.assertEqual(content.content[3].text, '{"count": 2.0}')
+
+    def test_extract_user_content_keeps_a2ui_actions_out_of_content(
+        self,
+    ) -> None:
+        action_part = _a2ui_to_part(
+            [
+                {
+                    "version": "v1.0",
+                    "action": {"name": CONFIRM_ACTION, "context": {}},
+                },
+            ],
+        )
+        message = Message(
+            role=Role.ROLE_USER,
+            parts=[
+                Part(text="approve it"),
+                action_part,
+            ],
+        )
+
+        content = _extract_user_content(message)
+
+        self.assertEqual(
+            [action["name"] for action in content.actions],
+            [
+                CONFIRM_ACTION,
+            ],
+        )
+        self.assertEqual(len(content.content), 1)
+        self.assertEqual(content.content[0].text, "approve it")
 
     def test_confirmation_component_and_action_data_part(self) -> None:
         tool_call = ToolCallBlock(
@@ -362,6 +448,33 @@ class A2AServerTest(IsolatedAsyncioTestCase):
                 for component in rendered_components
             ),
         )
+
+    async def test_execute_passes_attachments_to_the_agent(self) -> None:
+        executor = AgentScopeExecutor(model="test", api_key="unused")
+        fake_agent = _FakeAgent()
+        executor._agents["context-1"] = cast(Agent, fake_agent)
+        queue = _FakeEventQueue()
+        context = _FakeContext(
+            message=Message(
+                role=Role.ROLE_USER,
+                parts=[
+                    Part(text="what is this?"),
+                    Part(raw=b"abc", media_type="image/png", filename="a.png"),
+                ],
+                metadata=_renderer_metadata(),
+            ),
+            text_input="what is this?",
+        )
+
+        await executor.execute(cast(RequestContext, context), cast(Any, queue))
+
+        agent_input = fake_agent.inputs[-1]
+        self.assertEqual(
+            [type(block) for block in agent_input.content],
+            [TextBlock, DataBlock],
+        )
+        self.assertEqual(agent_input.content[0].text, "what is this?")
+        self.assertEqual(agent_input.content[1].source.data, "YWJj")
 
 
 if __name__ == "__main__":
