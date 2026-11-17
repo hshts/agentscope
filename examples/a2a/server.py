@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from google.protobuf import json_format, struct_pb2
-from pydantic import SecretStr
+from pydantic import AnyUrl, SecretStr
 import uvicorn
 
 from a2a.compat.v0_3 import types as types_v03
@@ -141,21 +141,6 @@ parser = cast(Parser, _processor.parser)
 
 logger = logging.getLogger(__name__)
 
-# def _a2ui_to_part(a2ui: dict[str, Any] | list[Any]) -> Part:
-#     """Encode an A2UI 1.0 message (or message list) as an A2A DataPart.
-
-#     ``ParseDict`` accepts a dict or a list at runtime, but its type stub
-#     only declares ``dict[str, Any]``.
-#     """
-#     return Part(
-#         data=json_format.ParseDict(
-#             cast(Any, a2ui),
-#             struct_pb2.Value(),
-#         ),
-#         metadata={"mimeType": A2UI_MIME_TYPE},
-#         media_type=A2UI_MIME_TYPE,
-#     )
-
 
 def _core_part(part: Part | types_v03.Part | None) -> Part | None:
     """Normalize a 1.0 or legacy 0.3 Part to the core 1.0 Part."""
@@ -230,7 +215,7 @@ def _url_part_to_block(part: Part) -> DataBlock | None:
         return None
     return DataBlock(
         source=URLSource(
-            url=part.url,
+            url=AnyUrl(part.url),
             media_type=part.media_type or "application/octet-stream",
         ),
         name=part.filename or None,
@@ -296,19 +281,6 @@ def _extract_user_content(
             if block is not None:
                 content.append(block)
     return _UserContent(content=content, actions=actions)
-
-
-# def _to_a2a_parts(parts: Sequence[ResponsePart]) -> list[Part]:
-#     """Convert a sequence of A2UI response parts into A2A message parts."""
-#     a2a_parts: list[Part] = []
-#     for a2ui_part in parts:
-#         if isinstance(a2ui_part, TextPart):
-#             a2a_parts.append(Part(text=a2ui_part.text))
-#         elif isinstance(a2ui_part, A2uiPart):
-#             for message in to_message_dicts(a2ui_part.a2ui):
-#                 a2a_parts.append(_a2ui_to_part(message))
-#     return a2a_parts
-
 
 
 
@@ -861,20 +833,20 @@ class AgentScopeExecutor(AgentExecutor):
             # the renderer only shows the resumed tool activity.
             await emit_delete_surfaces(task, updater, user_input)
         else:
-            content = user_content.content
+            blocks: list[TextBlock | DataBlock] = list(user_content.content)
             if actions:
                 # ``user_input`` already carries the action names, their
                 # context and the message text, so only attachments are
                 # added from the raw parts.
-                content = [
-                    block for block in content if isinstance(block, DataBlock)
+                blocks = [
+                    block for block in blocks if isinstance(block, DataBlock)
                 ]
                 if user_input.strip():
-                    content.insert(0, TextBlock(text=user_input))
-            elif not content and user_input.strip():
+                    blocks.insert(0, TextBlock(text=user_input))
+            elif not blocks and user_input.strip():
                 # Contexts that only expose ``get_user_input`` (no parts).
-                content = [TextBlock(text=user_input)]
-            agent_input = UserMsg(name="user", content=content)
+                blocks = [TextBlock(text=user_input)]
+            agent_input = UserMsg(name="user", content=blocks)
         streaming = bool(parser is not None and parser.supports_streaming)
   
 
