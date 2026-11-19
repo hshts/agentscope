@@ -676,7 +676,7 @@ async def emit_agent_message(
 ) -> None:
     """Send agent output as an A2A Message on a working status update."""
     message = updater.new_agent_message(list(parts))
-    message.extensions.extend(A2UI_EXTENSION_URI)
+    message.extensions.append(A2UI_EXTENSION_URI)
     await updater.update_status(
         TaskState.TASK_STATE_WORKING,
         message=message,
@@ -790,10 +790,14 @@ class AgentScopeExecutor(AgentExecutor):
         if task is None:
             # The task manager saves this exact object, so metadata
             # mutations (A2UI surface tracking) survive across requests.
+            # An agent-supplied Task is stored verbatim, so history has to be
+            # seeded here; the SDK only auto-fills it when it builds the Task
+            # from the initial message itself.
             task = Task(
                 id=task_id,
                 context_id=context_id,
                 status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
+                history=[context.message] if context.message else [],
             )
             await event_queue.enqueue_event(task)
 
